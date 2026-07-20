@@ -14,8 +14,8 @@ Focused workflow:
 
 Accuracy safeguards:
 
-- Directories, social networks and government portals are excluded unless an
-  exact listing matches the CUI or the full company-name/address identity.
+- Company-information sites, social networks and government portals are always
+  excluded. Only allowlisted contact directories may pass full identity checks.
 - Ambiguous names such as APICOLA or MATCA require location or CUI evidence.
 - A domain already assigned to another CUI is not silently reused.
 - Google result rank alone can never prove that a website is official.
@@ -70,7 +70,7 @@ from playwright.sync_api import (
     sync_playwright,
 )
 
-VERSION = "4.5"
+VERSION = "4.6"
 PROFILE_DIR = Path(__file__).parent / ".browser-profile"
 
 COMPANY_ALIASES = (
@@ -194,6 +194,10 @@ EXCLUDED_DOMAINS = {
     "rolocal.ro",
     "metricbiz.ro",
     "datasrl.ro",
+    "firmoteca.ro",
+    "icapb2b.ro",
+    "constatator-urgent.ro",
+    "tendersight.ai",
     "rrf.ro",
     "wikimapia.org",
     "waze.com",
@@ -221,6 +225,14 @@ EXCLUDED_DOMAINS = {
     "fcrmedia.ro",
     "rentasite.ro",
     "bionestcluster.ro",
+}
+
+# Unlike financial/company-data aggregators, these local directories primarily
+# expose public contact details. They may be used only after identity checks.
+VERIFIED_CONTACT_DIRECTORIES = {
+    "paginiaurii.ro",
+    "cylex.ro",
+    "deschis.ro",
 }
 
 LEGAL_SUFFIXES = {
@@ -593,6 +605,13 @@ def is_excluded_domain(domain: str) -> bool:
     )
 
 
+def is_verified_contact_directory(domain: str) -> bool:
+    return any(
+        domain == item or domain.endswith("." + item)
+        for item in VERIFIED_CONTACT_DIRECTORIES
+    )
+
+
 def is_google_domain(domain: str) -> bool:
     return any(
         domain == item or domain.endswith("." + item)
@@ -603,7 +622,7 @@ def is_google_domain(domain: str) -> bool:
 def is_verified_listing(candidate: GoogleCandidate) -> bool:
     return (
         candidate.source in {"knowledge_panel", "organic_listing"}
-        and is_excluded_domain(candidate.domain)
+        and is_verified_contact_directory(candidate.domain)
         and not is_google_domain(candidate.domain)
     )
 
@@ -814,7 +833,7 @@ def candidate_decision(
     reason = ""
     verified_listing = (
         source in {"knowledge_panel", "organic_listing"}
-        and is_excluded_domain(domain)
+        and is_verified_contact_directory(domain)
         and not is_google_domain(domain)
     )
 
@@ -1171,7 +1190,14 @@ def extract_knowledge_panel_candidate(
         domain = canonical_domain(href)
         # Exact Site links from the company panel may legitimately point to a
         # directory listing. Organic candidates keep the exclusion rule.
-        if not domain or is_google_domain(domain):
+        if (
+            not domain
+            or is_google_domain(domain)
+            or (
+                is_excluded_domain(domain)
+                and not is_verified_contact_directory(domain)
+            )
+        ):
             continue
 
         label = safe_inner_text(anchor, timeout=1_500)
@@ -1257,6 +1283,8 @@ def extract_organic_candidates(
         domain = canonical_domain(href)
         if not domain or domain in seen_domains or is_google_domain(domain):
             continue
+        if is_excluded_domain(domain) and not is_verified_contact_directory(domain):
+            continue
 
         title_locator = link.locator("h3")
         if title_locator.count() == 0:
@@ -1264,7 +1292,11 @@ def extract_organic_candidates(
 
         title = safe_inner_text(title_locator.first)
         snippet = result_snippet(link)
-        source = "organic_listing" if is_excluded_domain(domain) else "organic_result"
+        source = (
+            "organic_listing"
+            if is_verified_contact_directory(domain)
+            else "organic_result"
+        )
         candidate = candidate_decision(
             company=company,
             cui=cui,

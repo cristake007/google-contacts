@@ -71,7 +71,7 @@ from playwright.sync_api import (
     sync_playwright,
 )
 
-VERSION = "4.12"
+VERSION = "4.13"
 PROFILE_DIR = Path(__file__).parent / ".browser-profile"
 
 COMPANY_ALIASES = (
@@ -894,6 +894,7 @@ def assess_company_identity(
     website_domain: str = "",
     ambiguous_company: bool = False,
     trusted_google_panel: bool = False,
+    trusted_cui_panel_association: bool = False,
     corroborating_text: str = "",
 ) -> IdentityAssessment:
     website_cuis = extract_labeled_cuis(website_text)
@@ -952,29 +953,36 @@ def assess_company_identity(
     if name_score < 65 and domain_score >= 70 and corroborating_company >= 85:
         # A logo-only site may omit its name from visible body text. Strongly
         # aligned domain and independent Google evidence can fill that one gap.
-        name_score = 85
+        name_score = 100 if trusted_cui_panel_association else 85
     google_score = round(
-        corroborating_company * 0.6 + corroborating_location * 0.4
+        corroborating_company * 0.75 + corroborating_location * 0.25
     )
-    if contains_cui(cui, corroborating_text):
+    if contains_cui(cui, corroborating_text) or trusted_cui_panel_association:
         google_score = 100
 
     weighted_components = [
         (name_score, 0.30),
-        (domain_score, 0.20),
+        (domain_score, 0.25),
     ]
     if address_tokens(address):
-        weighted_components.append((address_score, 0.35))
+        weighted_components.append((address_score, 0.20))
     if normalize_text(county):
         weighted_components.append((locality_score, 0.10))
     if normalize_text(corroborating_text):
-        weighted_components.append((google_score, 0.05))
+        weighted_components.append((google_score, 0.15))
     total_weight = sum(weight for _, weight in weighted_components)
     score = round(
         sum(value * weight for value, weight in weighted_components)
         / total_weight
     )
-    threshold = 80 if ambiguous_company else 70
+    if ambiguous_company:
+        threshold = 80
+    elif name_score >= 85 and domain_score >= 90:
+        # An exact distinctive company/domain pair can represent the corporate
+        # site even when Excel contains a branch address absent from the site.
+        threshold = 65
+    else:
+        threshold = 70
     accepted = (
         score >= threshold
         and name_score >= 65
@@ -983,7 +991,8 @@ def assess_company_identity(
     component_summary = (
         f"identity score {score}/{threshold} "
         f"(name={name_score}, domain={domain_score}, address={address_score}, "
-        f"locality={locality_score}, Google={google_score})"
+        f"locality={locality_score}, Google={google_score}, "
+        f"CUI-panel={'yes' if trusted_cui_panel_association else 'no'})"
     )
     if accepted:
         if address_tokens(address) and address_score < 100:
@@ -2286,6 +2295,10 @@ def inspect_selected_website(
         identity_text,
         website_domain=website_domain,
         ambiguous_company=ambiguous_company,
+        trusted_cui_panel_association=(
+            candidate.source == "knowledge_panel"
+            and contains_cui(expected_cui, candidate.query)
+        ),
         corroborating_text=(
             f"{candidate.title}\n{candidate.snippet}\n"
             f"{candidate.panel_context}\n{corroborating_identity_text}"

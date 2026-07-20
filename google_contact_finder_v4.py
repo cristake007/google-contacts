@@ -63,6 +63,7 @@ from urllib.parse import parse_qs, quote_plus, urljoin, urlparse, urlunparse
 
 from openpyxl import load_workbook
 from openpyxl.styles import Font, PatternFill
+from openpyxl.utils import get_column_letter
 from playwright.sync_api import (
     BrowserContext,
     Locator,
@@ -71,7 +72,7 @@ from playwright.sync_api import (
     sync_playwright,
 )
 
-VERSION = "4.15"
+VERSION = "4.16"
 PROFILE_DIR = Path(__file__).parent / ".browser-profile"
 
 COMPANY_ALIASES = (
@@ -2645,6 +2646,12 @@ def ensure_output_columns(ws, header_row: int) -> dict[str, int]:
     return result
 
 
+def configure_worksheet_view(ws, header_row: int) -> None:
+    ws.freeze_panes = f"A{header_row + 1}"
+    last_column = get_column_letter(ws.max_column)
+    ws.auto_filter.ref = f"A{header_row}:{last_column}{ws.max_row}"
+
+
 def cell_text(ws, row: int, column: int | None) -> str:
     if column is None:
         return ""
@@ -2817,6 +2824,7 @@ def main() -> int:
         return 2
 
     output_columns = ensure_output_columns(ws, args.header_row)
+    configure_worksheet_view(ws, args.header_row)
     name_frequency = build_name_frequency(ws, input_columns, args.header_row)
     assigned_domains = build_assigned_domain_map(
         ws, input_columns, output_columns, args.header_row

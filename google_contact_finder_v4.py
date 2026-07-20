@@ -14,8 +14,8 @@ Focused workflow:
 
 Accuracy safeguards:
 
-- Directories, social networks and government portals are excluded from organic
-  results. An exact listing linked by Google's company panel may be inspected.
+- Directories, social networks and government portals are excluded unless an
+  exact listing matches the CUI or the full company-name/address identity.
 - Ambiguous names such as APICOLA or MATCA require location or CUI evidence.
 - A domain already assigned to another CUI is not silently reused.
 - Google result rank alone can never prove that a website is official.
@@ -70,7 +70,7 @@ from playwright.sync_api import (
     sync_playwright,
 )
 
-VERSION = "4.3"
+VERSION = "4.4"
 PROFILE_DIR = Path(__file__).parent / ".browser-profile"
 
 COMPANY_ALIASES = (
@@ -120,12 +120,14 @@ STATUS_FILL_COLORS = {
     "FOUND_CONTACT_PAGE": "D9EAD3",
     "FOUND_FOOTER": "D9EAD3",
     "FOUND_PANEL_LISTING": "D9EAD3",
+    "FOUND_VERIFIED_LISTING": "D9EAD3",
     "WEBSITE_NO_CONTACT": "D9EAF7",
     "REVIEW_GOOGLE_CANDIDATE": "FCE5CD",
     "REVIEW_DUPLICATE_DOMAIN": "FCE5CD",
     "REVIEW_AMBIGUOUS_NAME": "FCE5CD",
     "REVIEW_CUI_MISMATCH": "FCE5CD",
     "REVIEW_PANEL_LISTING": "FCE5CD",
+    "REVIEW_IDENTITY_MISMATCH": "FCE5CD",
     "NO_WEBSITE": "E7E6E6",
     "GOOGLE_BLOCKED": "FFF2CC",
     "ERROR": "F4CCCC",
@@ -573,9 +575,9 @@ def is_google_domain(domain: str) -> bool:
     )
 
 
-def is_panel_listing(candidate: GoogleCandidate) -> bool:
+def is_verified_listing(candidate: GoogleCandidate) -> bool:
     return (
-        candidate.source == "knowledge_panel"
+        candidate.source in {"knowledge_panel", "organic_listing"}
         and is_excluded_domain(candidate.domain)
         and not is_google_domain(candidate.domain)
     )
@@ -632,6 +634,32 @@ def address_tokens(address: str) -> list[str]:
     return result[:5]
 
 
+def address_street_number(address: str) -> str:
+    match = re.search(
+        r"(?i)\b(?:nr|numar(?:ul)?)\.?\s*[:#-]?\s*(\d+[a-z]?)\b",
+        address,
+    )
+    return normalize_text(match.group(1)) if match else ""
+
+
+def address_identity_match(county: str, address: str, text: str) -> bool:
+    normalized_text = normalize_text(text)
+    haystack = set(normalized_text.split())
+    matched_tokens = sum(token in haystack for token in address_tokens(address))
+    street_number = address_street_number(address)
+    number_found = bool(street_number and street_number in haystack)
+    county_normalized = normalize_text(county)
+    county_found = bool(county_normalized and county_normalized in normalized_text)
+
+    if street_number:
+        return (
+            number_found
+            and matched_tokens >= 1
+            and (county_found or matched_tokens >= 2)
+        )
+    return matched_tokens >= 2 and county_found
+
+
 def location_match_score(county: str, address: str, text: str) -> int:
     normalized = normalize_text(text)
     score = 0
@@ -660,6 +688,35 @@ def contains_cui(cui: str, text: str) -> bool:
 def extract_labeled_cuis(text: str) -> list[str]:
     """Extract fiscal identifiers only when they have an explicit CUI/CIF label."""
     return list(dict.fromkeys(match.group(1) for match in CUI_LABEL_RE.finditer(text)))
+
+
+def identity_decision(
+    company: str,
+    cui: str,
+    county: str,
+    address: str,
+    text: str,
+) -> tuple[bool, list[str], str, str]:
+    website_cuis = extract_labeled_cuis(text)
+    if website_cuis:
+        if cui in website_cuis:
+            return True, website_cuis, "MATCH", "CUI matched"
+        return False, website_cuis, "MISMATCH", "Published CUI belongs to another company"
+
+    company_score = company_match_score(company, text)
+    if company_score >= 85 and address_identity_match(county, address, text):
+        return (
+            True,
+            [],
+            "NOT_FOUND",
+            "CUI not published; company name and street address matched",
+        )
+    return (
+        False,
+        [],
+        "NOT_FOUND",
+        "CUI not published and company name/address evidence was insufficient",
+    )
 
 
 def is_ambiguous_company(company: str, name_frequency: Counter[str]) -> bool:
@@ -730,23 +787,34 @@ def candidate_decision(
     ambiguous = is_ambiguous_company(company, name_frequency)
     accepted = False
     reason = ""
-    panel_listing = (
-        source == "knowledge_panel"
+    verified_listing = (
+        source in {"knowledge_panel", "organic_listing"}
         and is_excluded_domain(domain)
         and not is_google_domain(domain)
     )
 
     if not domain or is_google_domain(domain):
         reason = "excluded or invalid domain"
-    elif is_excluded_domain(domain) and not panel_listing:
+    elif is_excluded_domain(domain) and not verified_listing:
         reason = "excluded domain"
-    elif duplicate_cuis and not panel_listing:
+    elif duplicate_cuis and not verified_listing:
         reason = "domain already assigned to another CUI"
     elif source == "knowledge_panel":
         # A Website/Site button in the company panel is strong enough to inspect.
         # The landing page or website CUI is checked before its contacts are
         # attached to the spreadsheet row.
         accepted = True
+    elif source == "organic_listing":
+        if cui_found and company_score >= 65:
+            accepted = True
+        elif company_score >= 85 and address_identity_match(
+            county,
+            address,
+            combined,
+        ):
+            accepted = True
+        else:
+            reason = "directory listing lacks matching CUI or full name/address"
     elif company_score < 65:
         reason = "company name does not match Google context"
     elif ambiguous:
@@ -794,19 +862,32 @@ def build_google_queries(
     clean_company = re.sub(r"\s+", " ", company).strip()
     county_clean = re.sub(r"\s+", " ", county).strip()
 
-    first_parts = [clean_company]
-    if county_clean:
-        first_parts.append(county_clean)
-    if ambiguous:
-        tokens = address_tokens(address)
-        if tokens:
-            first_parts.append(tokens[0])
+    street = re.sub(r"\s+", " ", address.split(",", 1)[0]).strip()
+    street_number = address_street_number(address)
+    if street:
+        first_parts = [f'"{clean_company}"', f'"{street}"']
+        if street_number:
+            first_parts.append(f'"{street_number}"')
+        if county_clean:
+            first_parts.append(county_clean)
+        first_query = " ".join(first_parts)
+    else:
+        first_query = " ".join(part for part in (clean_company, county_clean) if part)
 
-    first_query = " ".join(first_parts)
-    second_query = f'"{clean_company}" "{cui}"'
+    exact_cui_query = f'"{clean_company}" "{cui}"'
+    contact_terms = "(contact OR telefon OR email)"
+    cui_contact_query = f'"{cui}" {contact_terms}'
+    company_contact_query = " ".join(
+        part
+        for part in (f'"{clean_company}"', county_clean, contact_terms)
+        if part
+    )
 
     result: list[str] = []
-    for query in (first_query, second_query):
+    queries = [first_query, exact_cui_query]
+    if ambiguous:
+        queries.extend((cui_contact_query, company_contact_query))
+    for query in queries:
         if query and query not in result:
             result.append(query)
     return result
@@ -1077,7 +1158,7 @@ def extract_organic_candidates(
             continue
 
         domain = canonical_domain(href)
-        if not domain or domain in seen_domains or is_excluded_domain(domain):
+        if not domain or domain in seen_domains or is_google_domain(domain):
             continue
 
         title_locator = link.locator("h3")
@@ -1086,6 +1167,7 @@ def extract_organic_candidates(
 
         title = safe_inner_text(title_locator.first)
         snippet = result_snippet(link)
+        source = "organic_listing" if is_excluded_domain(domain) else "organic_result"
         candidate = candidate_decision(
             company=company,
             cui=cui,
@@ -1096,11 +1178,13 @@ def extract_organic_candidates(
             context=snippet,
             query=query,
             rank=index + 1,
-            source="organic_result",
+            source=source,
             min_website_score=min_website_score,
             name_frequency=name_frequency,
             assigned_domains=assigned_domains,
         )
+        if source == "organic_listing" and not candidate.accepted:
+            continue
         candidates.append(candidate)
         seen_domains.add(domain)
 
@@ -1200,8 +1284,13 @@ def discover_website(
         for candidate in candidates[:5]:
             marker = "ACCEPT" if candidate.accepted else "review"
             reason = f" ({candidate.rejection_reason})" if not candidate.accepted else ""
+            result_kind = (
+                "Verified listing"
+                if candidate.source == "organic_listing"
+                else "Organic"
+            )
             print(
-                f"    Organic {marker}: rank={candidate.rank}, "
+                f"    {result_kind} {marker}: rank={candidate.rank}, "
                 f"domain={candidate.domain}, score={candidate.score}{reason}"
             )
 
@@ -1520,36 +1609,37 @@ def contact_page_data(
     page: Page,
     contact_url: str,
     website_domain: str,
-) -> tuple[list[ContactValue], list[ContactValue], list[str], str]:
+) -> tuple[list[ContactValue], list[ContactValue], list[str], str, str]:
     if not contact_url or not open_page(page, contact_url):
-        return [], [], [], ""
+        return [], [], [], "", ""
     try:
         body = page.locator("body")
         text = body.inner_text(timeout=15_000)
     except Exception:
-        return [], [], [], page.url
+        return [], [], [], page.url, ""
     return (
         collect_emails(text, body, "contact_page", website_domain),
         collect_phones(text, body, "contact_page"),
         extract_labeled_cuis(text),
         page.url,
+        text,
     )
 
 
 def primary_content_locator(page: Page) -> Locator:
     selectors = (
+        "[itemtype*='LocalBusiness']",
+        "[class*='listing-detail']",
+        "[class*='company-detail']",
         "main",
         "[role='main']",
         "#main",
         "#content",
-        "[itemtype*='LocalBusiness']",
-        "[class*='listing-detail']",
-        "[class*='company-detail']",
     )
-    best: Locator | None = None
-    best_length = -1
     for selector in selectors:
         locator = page.locator(selector)
+        best: Locator | None = None
+        best_length = -1
         try:
             for index in range(min(locator.count(), 12)):
                 item = locator.nth(index)
@@ -1561,17 +1651,21 @@ def primary_content_locator(page: Page) -> Locator:
                     best_length = length
         except Exception:
             continue
-    return best if best is not None else page.locator("body")
+        if best is not None and best_length >= 20:
+            return best
+    return page.locator("body")
 
 
-def inspect_panel_listing(
+def inspect_verified_listing(
     page: Page,
     candidate: GoogleCandidate,
     expected_company: str,
     expected_cui: str,
+    expected_county: str,
+    expected_address: str,
 ) -> ContactResult:
     checked_at = datetime.now().isoformat(timespec="seconds")
-    print(f"  Opening exact knowledge-panel listing: {candidate.url}")
+    print(f"  Opening exact verified listing: {candidate.url}")
     if not open_page(page, candidate.url):
         return ContactResult(
             website=candidate.url,
@@ -1582,43 +1676,38 @@ def inspect_panel_listing(
             status="ERROR",
             website_score=candidate.score,
             checked_at=checked_at,
-            notes="Knowledge-panel listing could not be opened",
+            notes="Verified listing could not be opened",
         )
 
     content = primary_content_locator(page)
     text = safe_inner_text(content, timeout=15_000)
-    company_score = company_match_score(expected_company, text)
     website_domain = canonical_domain(page.url) or candidate.domain
     emails = merge_contact_values(
-        collect_emails(text, content, "panel_listing", website_domain)
+        collect_emails(text, content, "verified_listing", website_domain)
     )
-    phones = merge_contact_values(collect_phones(text, content, "panel_listing"))
-    website_cuis = extract_labeled_cuis(text)
+    phones = merge_contact_values(collect_phones(text, content, "verified_listing"))
+    identity_ok, website_cuis, cui_match_status, identity_notes = identity_decision(
+        expected_company,
+        expected_cui,
+        expected_county,
+        expected_address,
+        text,
+    )
 
-    if expected_cui in website_cuis:
-        cui_match_status = "MATCH"
-    elif website_cuis:
-        cui_match_status = "MISMATCH"
-    else:
-        cui_match_status = "NOT_FOUND"
-
-    if cui_match_status == "MISMATCH":
+    if not identity_ok and cui_match_status == "MISMATCH":
         status = "REVIEW_CUI_MISMATCH"
-        notes = "Panel listing CUI differs from the searched company"
-    elif company_score < 65:
-        status = "REVIEW_PANEL_LISTING"
-        notes = "Company name was not confirmed on the panel-linked listing"
+        notes = identity_notes
+    elif not identity_ok:
+        status = "REVIEW_IDENTITY_MISMATCH"
+        notes = identity_notes
     elif emails or phones:
-        status = "FOUND_PANEL_LISTING"
-        notes = (
-            "Contacts extracted from the exact listing linked by Google's "
-            "Site button"
-        )
+        status = "FOUND_VERIFIED_LISTING"
+        notes = f"Contacts extracted from verified listing; {identity_notes}"
     else:
         status = "WEBSITE_NO_CONTACT"
-        notes = "No contact details found on the exact panel-linked listing"
+        notes = "No contact details found on the exact verified listing"
 
-    keep_contacts = status == "FOUND_PANEL_LISTING"
+    keep_contacts = status == "FOUND_VERIFIED_LISTING"
     final_url = normalize_url(page.url) or candidate.url
     return ContactResult(
         website=final_url,
@@ -1633,7 +1722,7 @@ def inspect_panel_listing(
         phone=phones[0].value if phones and keep_contacts else "",
         all_emails=[item.value for item in emails] if keep_contacts else [],
         all_phones=[item.value for item in phones] if keep_contacts else [],
-        found_in="panel_listing" if keep_contacts else "",
+        found_in="verified_listing" if keep_contacts else "",
         status=status,
         website_score=candidate.score,
         checked_at=checked_at,
@@ -1655,13 +1744,17 @@ def inspect_selected_website(
     candidate: GoogleCandidate,
     expected_company: str,
     expected_cui: str,
+    expected_county: str,
+    expected_address: str,
 ) -> ContactResult:
-    if is_panel_listing(candidate):
-        return inspect_panel_listing(
+    if is_verified_listing(candidate):
+        return inspect_verified_listing(
             page,
             candidate,
             expected_company,
             expected_cui,
+            expected_county,
+            expected_address,
         )
 
     checked_at = datetime.now().isoformat(timespec="seconds")
@@ -1690,7 +1783,8 @@ def inspect_selected_website(
 
     homepage = base_url(page.url)
     website_domain = canonical_domain(page.url) or website_domain
-    footer_emails, footer_phones, footer_cuis = footer_data(page, website_domain)
+    homepage_identity_text = safe_inner_text(page.locator("body"), timeout=15_000)
+    footer_emails, footer_phones, _footer_cuis = footer_data(page, website_domain)
     contact_url = discover_contact_url(
         page=page,
         website_domain=website_domain,
@@ -1699,42 +1793,50 @@ def inspect_selected_website(
 
     contact_emails: list[ContactValue] = []
     contact_phones: list[ContactValue] = []
-    contact_cuis: list[str] = []
+    _contact_cuis: list[str] = []
     final_contact_url = ""
+    contact_identity_text = ""
 
     if contact_url:
         print(f"  Opening contact page: {contact_url}")
-        contact_emails, contact_phones, contact_cuis, final_contact_url = contact_page_data(
-            page=page,
-            contact_url=contact_url,
-            website_domain=website_domain,
-        )
+        (
+            contact_emails,
+            contact_phones,
+            _contact_cuis,
+            final_contact_url,
+            contact_identity_text,
+        ) = contact_page_data(page, contact_url, website_domain)
     else:
         contact_url = urljoin(homepage, "/contact")
         print(f"  No contact link found; trying standard path: {contact_url}")
-        contact_emails, contact_phones, contact_cuis, final_contact_url = contact_page_data(
-            page=page,
-            contact_url=contact_url,
-            website_domain=website_domain,
-        )
+        (
+            contact_emails,
+            contact_phones,
+            _contact_cuis,
+            final_contact_url,
+            contact_identity_text,
+        ) = contact_page_data(page, contact_url, website_domain)
 
     emails = merge_contact_values(contact_emails + footer_emails)
     phones = merge_contact_values(contact_phones + footer_phones)
-    website_cuis = list(dict.fromkeys(contact_cuis + footer_cuis))
-    if expected_cui in website_cuis:
-        cui_match_status = "MATCH"
-    elif website_cuis:
-        cui_match_status = "MISMATCH"
-    else:
-        cui_match_status = "NOT_FOUND"
+    identity_text = f"{homepage_identity_text}\n{contact_identity_text}"
+    identity_ok, website_cuis, cui_match_status, identity_notes = identity_decision(
+        expected_company,
+        expected_cui,
+        expected_county,
+        expected_address,
+        identity_text,
+    )
     sources: list[str] = []
     if contact_emails or contact_phones:
         sources.append("contact_page")
     if footer_emails or footer_phones:
         sources.append("footer")
 
-    if cui_match_status == "MISMATCH":
+    if not identity_ok and cui_match_status == "MISMATCH":
         status = "REVIEW_CUI_MISMATCH"
+    elif not identity_ok:
+        status = "REVIEW_IDENTITY_MISMATCH"
     elif contact_emails or contact_phones:
         status = "FOUND_CONTACT_PAGE"
     elif footer_emails or footer_phones:
@@ -1752,25 +1854,24 @@ def inspect_selected_website(
         website_cuis=website_cuis,
         cui_match_status=cui_match_status,
         contact_page_url=final_contact_url,
-        email=emails[0].value if emails and cui_match_status != "MISMATCH" else "",
-        phone=phones[0].value if phones and cui_match_status != "MISMATCH" else "",
+        email=emails[0].value if emails and identity_ok else "",
+        phone=phones[0].value if phones and identity_ok else "",
         all_emails=(
-            [item.value for item in emails] if cui_match_status != "MISMATCH" else []
+            [item.value for item in emails] if identity_ok else []
         ),
         all_phones=(
-            [item.value for item in phones] if cui_match_status != "MISMATCH" else []
+            [item.value for item in phones] if identity_ok else []
         ),
-        found_in="; ".join(sources) if cui_match_status != "MISMATCH" else "",
+        found_in="; ".join(sources) if identity_ok else "",
         status=status,
         website_score=candidate.score,
         duplicate_cuis=candidate.duplicate_cuis,
         checked_at=checked_at,
         notes=(
-            "Website CUI differs from the searched company; contacts were not "
-            "attached to this row"
-            if cui_match_status == "MISMATCH"
-            else "Website selected from Google's company panel or organic results; "
-            "only homepage footer and one contact page were inspected"
+            f"Contacts rejected: {identity_notes}"
+            if not identity_ok
+            else "Website identity verified; "
+            f"{identity_notes}; homepage footer and one contact page inspected"
         ),
     )
 
@@ -2038,6 +2139,7 @@ def main() -> int:
                         "REVIEW_AMBIGUOUS_NAME",
                         "REVIEW_CUI_MISMATCH",
                         "REVIEW_PANEL_LISTING",
+                        "REVIEW_IDENTITY_MISMATCH",
                     }
                     if not (args.retry_failed and retryable):
                         continue
@@ -2072,6 +2174,8 @@ def main() -> int:
                             accepted,
                             company,
                             cui,
+                            county,
+                            address,
                         )
                     elif review is not None:
                         if review.duplicate_cuis:

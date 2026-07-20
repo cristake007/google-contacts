@@ -70,7 +70,7 @@ from playwright.sync_api import (
     sync_playwright,
 )
 
-VERSION = "4.7"
+VERSION = "4.8"
 PROFILE_DIR = Path(__file__).parent / ".browser-profile"
 
 COMPANY_ALIASES = (
@@ -198,6 +198,8 @@ EXCLUDED_DOMAINS = {
     "icapb2b.ro",
     "constatator-urgent.ro",
     "tendersight.ai",
+    "topchecks.ro",
+    "fgo.ro",
     "rrf.ro",
     "wikimapia.org",
     "waze.com",
@@ -884,6 +886,8 @@ def candidate_decision(
     elif source == "knowledge_panel":
         if cui_found and company_score >= 65:
             accepted = True
+        elif contains_cui(cui, query) and company_score >= 65:
+            accepted = True
         elif company_score >= 85 and address_identity_match(
             county,
             address,
@@ -1217,6 +1221,7 @@ def extract_knowledge_panel_candidate(
         count = min(anchors.count(), 160)
     except Exception:
         count = 0
+    full_panel_text = google_panel_text(page)
 
     for index in range(count):
         anchor = anchors.nth(index)
@@ -1245,7 +1250,8 @@ def extract_knowledge_panel_candidate(
         if not has_knowledge_website_hint(hint_text):
             continue
 
-        panel_text = knowledge_panel_context(anchor)
+        nearby_panel_text = knowledge_panel_context(anchor)
+        panel_text = f"{full_panel_text}\n{nearby_panel_text}".strip()
         candidate = candidate_decision(
             company=company,
             cui=cui,
@@ -2040,14 +2046,20 @@ def inspect_selected_website(
     if (
         not identity_ok
         and cui_match_status == "NOT_FOUND"
-        and candidate.cui_found
         and candidate.company_score >= 65
+        and (
+            candidate.cui_found
+            or (
+                candidate.source == "knowledge_panel"
+                and contains_cui(expected_cui, candidate.query)
+            )
+        )
     ):
         identity_ok = True
         cui_match_status = "GOOGLE_MATCH"
         identity_notes = (
-            "Exact CUI and company name matched the Google result for this domain; "
-            "the website publishes a different current address"
+            "Exact CUI query and matching Google-panel company identified this "
+            "domain; the website publishes a different current address"
         )
     sources: list[str] = []
     if contact_emails or contact_phones:

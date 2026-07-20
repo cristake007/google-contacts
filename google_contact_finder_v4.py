@@ -71,7 +71,7 @@ from playwright.sync_api import (
     sync_playwright,
 )
 
-VERSION = "4.10"
+VERSION = "4.11"
 PROFILE_DIR = Path(__file__).parent / ".browser-profile"
 
 COMPANY_ALIASES = (
@@ -113,6 +113,8 @@ OUTPUT_COLUMNS = (
     "contact_found_in",
     "contact_status",
     "website_score",
+    "identity_score",
+    "identity_evidence",
     "duplicate_domain_cui",
     "contact_checked_at",
     "contact_notes",
@@ -469,9 +471,25 @@ class ContactResult:
     found_in: str = ""
     status: str = "NO_WEBSITE"
     website_score: int = 0
+    identity_score: int = 0
+    identity_evidence: str = ""
     duplicate_cuis: list[str] = field(default_factory=list)
     checked_at: str = ""
     notes: str = ""
+
+
+@dataclass
+class IdentityAssessment:
+    accepted: bool
+    score: int
+    company_score: int
+    domain_score: int
+    address_score: int
+    locality_score: int
+    google_score: int
+    website_cuis: list[str]
+    cui_status: str
+    reason: str
 
 
 def merge_google_panel_contact(
@@ -786,33 +804,41 @@ def address_identity_match(county: str, address: str, text: str) -> bool:
     return matched_tokens >= 2 and county_found
 
 
-def stale_address_identity_match(
-    county: str,
-    address: str,
-    text: str,
-    corroborating_text: str = "",
-) -> bool:
-    """Match the stable street/locality parts when an old street number changed."""
-    normalized_text = normalize_text(text)
-    normalized_corroboration = normalize_text(corroborating_text)
-    county_normalized = normalize_text(county)
-    if (
-        county_normalized
-        and county_normalized not in normalized_text
-        and county_normalized not in normalized_corroboration
-    ):
-        return False
+def fuzzy_token_coverage(expected_tokens: list[str], text: str) -> int:
+    if not expected_tokens:
+        return 0
+    text_tokens = normalize_text(text).split()
+    matched = sum(
+        token in text_tokens or fuzzy_token_present(token, text_tokens, 0.86)
+        for token in expected_tokens
+    )
+    return round(100 * matched / len(expected_tokens))
 
-    county_tokens = set(county_normalized.split())
+
+def address_match_score(county: str, address: str, text: str) -> int:
+    county_tokens = set(normalize_text(county).split())
     stable_tokens = [
         token for token in address_tokens(address) if token not in county_tokens
     ]
-    text_tokens = normalized_text.split()
-    return bool(stable_tokens) and any(
-        token in text_tokens
-        or fuzzy_token_present(token, text_tokens, 0.86)
-        for token in stable_tokens
-    )
+    coverage = fuzzy_token_coverage(stable_tokens, text)
+    if coverage == 0:
+        return 0
+    if address_identity_match(county, address, text):
+        return 100
+
+    # Street and locality names are more stable than building identifiers.
+    # Retain most of the evidence when the street number has changed or vanished.
+    return round(coverage * 0.8)
+
+
+def locality_match_score(county: str, *texts: str) -> int:
+    county_normalized = normalize_text(county)
+    if not county_normalized:
+        return 0
+    combined = normalize_text("\n".join(texts))
+    if county_normalized in combined:
+        return 100
+    return fuzzy_token_coverage(county_normalized.split(), combined)
 
 
 def location_match_score(county: str, address: str, text: str) -> int:
@@ -845,60 +871,132 @@ def extract_labeled_cuis(text: str) -> list[str]:
     return list(dict.fromkeys(match.group(1) for match in CUI_LABEL_RE.finditer(text)))
 
 
-def identity_decision(
+def assess_company_identity(
     company: str,
     cui: str,
     county: str,
     address: str,
-    text: str,
+    website_text: str,
     *,
     website_domain: str = "",
-    allow_stale_address: bool = False,
     ambiguous_company: bool = False,
     trusted_google_panel: bool = False,
     corroborating_text: str = "",
-) -> tuple[bool, list[str], str, str]:
-    website_cuis = extract_labeled_cuis(text)
+) -> IdentityAssessment:
+    website_cuis = extract_labeled_cuis(website_text)
     if website_cuis:
         if cui in website_cuis:
-            return True, website_cuis, "MATCH", "CUI matched"
-        return False, website_cuis, "MISMATCH", "Published CUI belongs to another company"
+            return IdentityAssessment(
+                accepted=True,
+                score=100,
+                company_score=100,
+                domain_score=100,
+                address_score=100,
+                locality_score=100,
+                google_score=100,
+                website_cuis=website_cuis,
+                cui_status="MATCH",
+                reason="CUI matched",
+            )
+        return IdentityAssessment(
+            accepted=False,
+            score=0,
+            company_score=0,
+            domain_score=0,
+            address_score=0,
+            locality_score=0,
+            google_score=0,
+            website_cuis=website_cuis,
+            cui_status="MISMATCH",
+            reason="Published CUI belongs to another company",
+        )
 
-    company_score = company_match_score(company, text)
-    if company_score >= 85 and address_identity_match(county, address, text):
-        return (
-            True,
-            [],
-            "NOT_FOUND",
-            "CUI not published; company name and street address matched",
-        )
-    if (
-        allow_stale_address
-        and not ambiguous_company
-        and company_score >= 85
-        and (
-            trusted_google_panel
-            or domain_company_score(company, website_domain) >= 45
-        )
-        and stale_address_identity_match(
-            county,
-            address,
-            text,
-            corroborating_text,
-        )
-    ):
-        return (
-            True,
-            [],
-            "STALE_ADDRESS_MATCH",
-            "CUI not published; distinctive company/domain and street/locality "
-            "matched, but the street number appears to have changed",
-        )
-    return (
-        False,
-        [],
-        "NOT_FOUND",
-        "CUI not published and company name/address evidence was insufficient",
+    name_score = company_match_score(company, website_text)
+    raw_domain_score = domain_company_score(company, website_domain)
+    domain_score = min(100, raw_domain_score * 2)
+    if domain_score == 0 and website_domain:
+        domain_stem = normalize_text(
+            website_domain.split(".", 1)[0]
+        ).replace(" ", "")
+        if any(
+            len(token) >= 4 and token.replace(" ", "") in domain_stem
+            for token in company_tokens(company)
+        ):
+            domain_score = 65
+    if trusted_google_panel:
+        domain_score = max(domain_score, 75)
+    address_score = address_match_score(county, address, website_text)
+    locality_score = locality_match_score(
+        county,
+        website_text,
+        corroborating_text,
+    )
+    corroborating_company = company_match_score(company, corroborating_text)
+    corroborating_location = min(
+        100,
+        location_match_score(county, address, corroborating_text) * 2,
+    )
+    if name_score < 65 and domain_score >= 70 and corroborating_company >= 85:
+        # A logo-only site may omit its name from visible body text. Strongly
+        # aligned domain and independent Google evidence can fill that one gap.
+        name_score = 85
+    google_score = round(
+        corroborating_company * 0.6 + corroborating_location * 0.4
+    )
+    if contains_cui(cui, corroborating_text):
+        google_score = 100
+
+    weighted_components = [
+        (name_score, 0.30),
+        (domain_score, 0.20),
+    ]
+    if address_tokens(address):
+        weighted_components.append((address_score, 0.35))
+    if normalize_text(county):
+        weighted_components.append((locality_score, 0.10))
+    if normalize_text(corroborating_text):
+        weighted_components.append((google_score, 0.05))
+    total_weight = sum(weight for _, weight in weighted_components)
+    score = round(
+        sum(value * weight for value, weight in weighted_components)
+        / total_weight
+    )
+    threshold = 80 if ambiguous_company else 70
+    accepted = (
+        score >= threshold
+        and name_score >= 65
+        and (address_score >= 50 or domain_score >= 70)
+    )
+    component_summary = (
+        f"identity score {score}/{threshold} "
+        f"(name={name_score}, domain={domain_score}, address={address_score}, "
+        f"locality={locality_score}, Google={google_score})"
+    )
+    if accepted:
+        if address_tokens(address) and address_score < 100:
+            cui_status = "FUZZY_IDENTITY_MATCH"
+            reason = (
+                f"CUI not published; {component_summary}; address differences "
+                "were outweighed by the combined identity evidence"
+            )
+        else:
+            cui_status = "NOT_FOUND"
+            reason = f"CUI not published; {component_summary}"
+    else:
+        cui_status = "NOT_FOUND"
+        reason = f"CUI not published; insufficient {component_summary}"
+
+    return IdentityAssessment(
+        accepted=accepted,
+        score=score,
+        company_score=name_score,
+        domain_score=domain_score,
+        address_score=address_score,
+        locality_score=locality_score,
+        google_score=google_score,
+        website_cuis=[],
+        cui_status=cui_status,
+        reason=reason,
     )
 
 
@@ -1256,17 +1354,16 @@ def extract_google_panel_contact(
     if not panel_text:
         return None
 
-    identity_ok, panel_cuis, cui_match_status, identity_notes = identity_decision(
+    assessment = assess_company_identity(
         company,
         cui,
         county,
         address,
         panel_text,
-        allow_stale_address=True,
         ambiguous_company=ambiguous_company,
         trusted_google_panel=True,
     )
-    if not identity_ok:
+    if not assessment.accepted:
         return None
 
     emails = merge_contact_values(
@@ -1283,16 +1380,18 @@ def extract_google_panel_contact(
         google_title=company,
         google_query=query,
         panel_context=panel_text[:1000],
-        website_cuis=panel_cuis,
-        cui_match_status=cui_match_status,
+        website_cuis=assessment.website_cuis,
+        cui_match_status=assessment.cui_status,
         email=emails[0].value if emails else "",
         phone=phones[0].value if phones else "",
         all_emails=[item.value for item in emails],
         all_phones=[item.value for item in phones],
         found_in="google_panel",
         status="FOUND_GOOGLE_PANEL",
+        identity_score=assessment.score,
+        identity_evidence=assessment.reason,
         checked_at=datetime.now().isoformat(timespec="seconds"),
-        notes=f"Google panel identity verified; {identity_notes}",
+        notes=f"Google panel identity verified; {assessment.reason}",
     )
 
 
@@ -2024,23 +2123,25 @@ def inspect_verified_listing(
         collect_emails(text, content, "verified_listing", website_domain)
     )
     phones = merge_contact_values(collect_phones(text, content, "verified_listing"))
-    identity_ok, website_cuis, cui_match_status, identity_notes = identity_decision(
+    assessment = assess_company_identity(
         expected_company,
         expected_cui,
         expected_county,
         expected_address,
         text,
+        website_domain=website_domain,
     )
+    identity_ok = assessment.accepted
 
-    if not identity_ok and cui_match_status == "MISMATCH":
+    if not identity_ok and assessment.cui_status == "MISMATCH":
         status = "REVIEW_CUI_MISMATCH"
-        notes = identity_notes
+        notes = assessment.reason
     elif not identity_ok:
         status = "REVIEW_IDENTITY_MISMATCH"
-        notes = identity_notes
+        notes = assessment.reason
     elif emails or phones:
         status = "FOUND_VERIFIED_LISTING"
-        notes = f"Contacts extracted from verified listing; {identity_notes}"
+        notes = f"Contacts extracted from verified listing; {assessment.reason}"
     else:
         status = "WEBSITE_NO_CONTACT"
         notes = "No contact details found on the exact verified listing"
@@ -2054,8 +2155,8 @@ def inspect_verified_listing(
         google_title=candidate.title,
         google_query=candidate.query,
         panel_context=candidate.panel_context,
-        website_cuis=website_cuis,
-        cui_match_status=cui_match_status,
+        website_cuis=assessment.website_cuis,
+        cui_match_status=assessment.cui_status,
         contact_page_url=final_url,
         email=emails[0].value if emails and keep_contacts else "",
         phone=phones[0].value if phones and keep_contacts else "",
@@ -2064,6 +2165,8 @@ def inspect_verified_listing(
         found_in="verified_listing" if keep_contacts else "",
         status=status,
         website_score=candidate.score,
+        identity_score=assessment.score,
+        identity_evidence=assessment.reason,
         checked_at=checked_at,
         notes=notes,
     )
@@ -2162,45 +2265,27 @@ def inspect_selected_website(
     emails = merge_contact_values(contact_emails + footer_emails)
     phones = merge_contact_values(contact_phones + footer_phones)
     identity_text = f"{homepage_identity_text}\n{contact_identity_text}"
-    identity_ok, website_cuis, cui_match_status, identity_notes = identity_decision(
+    assessment = assess_company_identity(
         expected_company,
         expected_cui,
         expected_county,
         expected_address,
         identity_text,
         website_domain=website_domain,
-        allow_stale_address=True,
         ambiguous_company=ambiguous_company,
         corroborating_text=(
             f"{candidate.title}\n{candidate.snippet}\n"
             f"{candidate.panel_context}\n{corroborating_identity_text}"
         ),
     )
-    if (
-        not identity_ok
-        and cui_match_status == "NOT_FOUND"
-        and candidate.company_score >= 65
-        and (
-            candidate.cui_found
-            or (
-                candidate.source == "knowledge_panel"
-                and contains_cui(expected_cui, candidate.query)
-            )
-        )
-    ):
-        identity_ok = True
-        cui_match_status = "GOOGLE_MATCH"
-        identity_notes = (
-            "Exact CUI query and matching Google-panel company identified this "
-            "domain; the website publishes a different current address"
-        )
+    identity_ok = assessment.accepted
     sources: list[str] = []
     if contact_emails or contact_phones:
         sources.append("contact_page")
     if footer_emails or footer_phones:
         sources.append("footer")
 
-    if not identity_ok and cui_match_status == "MISMATCH":
+    if not identity_ok and assessment.cui_status == "MISMATCH":
         status = "REVIEW_CUI_MISMATCH"
     elif not identity_ok:
         status = "REVIEW_IDENTITY_MISMATCH"
@@ -2219,8 +2304,8 @@ def inspect_selected_website(
         google_title=candidate.title,
         google_query=candidate.query,
         panel_context=candidate.panel_context,
-        website_cuis=website_cuis,
-        cui_match_status=cui_match_status,
+        website_cuis=assessment.website_cuis,
+        cui_match_status=assessment.cui_status,
         contact_page_url=final_contact_url,
         email=emails[0].value if emails and identity_ok else "",
         phone=phones[0].value if phones and identity_ok else "",
@@ -2233,13 +2318,15 @@ def inspect_selected_website(
         found_in="; ".join(sources) if identity_ok else "",
         status=status,
         website_score=candidate.score,
+        identity_score=assessment.score,
+        identity_evidence=assessment.reason,
         duplicate_cuis=candidate.duplicate_cuis,
         checked_at=checked_at,
         notes=(
-            f"Contacts rejected: {identity_notes}"
+            f"Contacts rejected: {assessment.reason}"
             if not identity_ok
             else "Website identity verified; "
-            f"{identity_notes}; homepage footer and one contact page inspected"
+            f"{assessment.reason}; homepage footer and one contact page inspected"
         ),
     )
 
@@ -2323,6 +2410,8 @@ def write_result(
         "contact_found_in": result.found_in,
         "contact_status": result.status,
         "website_score": result.website_score,
+        "identity_score": result.identity_score,
+        "identity_evidence": result.identity_evidence,
         "duplicate_domain_cui": "; ".join(result.duplicate_cuis),
         "contact_checked_at": result.checked_at,
         "contact_notes": result.notes,
@@ -2639,7 +2728,8 @@ def main() -> int:
                     f"candidate={result.candidate_url or '-'} | "
                     f"email={result.email or '-'} | "
                     f"phone={result.phone or '-'} | "
-                    f"score={result.website_score}"
+                    f"search_score={result.website_score} | "
+                    f"identity_score={result.identity_score}"
                 )
 
                 if args.save_every > 0 and processed % args.save_every == 0:

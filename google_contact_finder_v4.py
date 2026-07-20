@@ -70,7 +70,7 @@ from playwright.sync_api import (
     sync_playwright,
 )
 
-VERSION = "4.4"
+VERSION = "4.5"
 PROFILE_DIR = Path(__file__).parent / ".browser-profile"
 
 COMPANY_ALIASES = (
@@ -121,6 +121,7 @@ STATUS_FILL_COLORS = {
     "FOUND_FOOTER": "D9EAD3",
     "FOUND_PANEL_LISTING": "D9EAD3",
     "FOUND_VERIFIED_LISTING": "D9EAD3",
+    "FOUND_GOOGLE_PANEL": "D9EAD3",
     "WEBSITE_NO_CONTACT": "D9EAF7",
     "REVIEW_GOOGLE_CANDIDATE": "FCE5CD",
     "REVIEW_DUPLICATE_DOMAIN": "FCE5CD",
@@ -450,6 +451,30 @@ class ContactResult:
     duplicate_cuis: list[str] = field(default_factory=list)
     checked_at: str = ""
     notes: str = ""
+
+
+def merge_google_panel_contact(
+    result: ContactResult,
+    panel_contact: ContactResult,
+) -> ContactResult:
+    if not result.status.startswith("FOUND_"):
+        panel_contact.notes += f"; linked-site result was {result.status}"
+        return panel_contact
+
+    result.all_emails = list(
+        dict.fromkeys(result.all_emails + panel_contact.all_emails)
+    )
+    result.all_phones = list(
+        dict.fromkeys(result.all_phones + panel_contact.all_phones)
+    )
+    result.email = result.email or panel_contact.email
+    result.phone = result.phone or panel_contact.phone
+    if panel_contact.found_in and panel_contact.found_in not in result.found_in:
+        result.found_in = "; ".join(
+            item for item in (result.found_in, panel_contact.found_in) if item
+        )
+    result.notes += "; matching Google-panel contacts included"
+    return result
 
 
 def normalize_text(value: Any) -> str:
@@ -1024,6 +1049,78 @@ def knowledge_panel_context(anchor: Locator) -> str:
         return ""
 
 
+def google_panel_text(page: Page) -> str:
+    selectors = (
+        "#rhs",
+        "[role='complementary']",
+        "[data-attrid*='kc:/']",
+    )
+    best = ""
+    for selector in selectors:
+        locator = page.locator(selector)
+        try:
+            for index in range(min(locator.count(), 20)):
+                item = locator.nth(index)
+                if not item.is_visible():
+                    continue
+                text = safe_inner_text(item, timeout=3_000)
+                if len(text) > len(best):
+                    best = text
+        except Exception:
+            continue
+    return best
+
+
+def extract_google_panel_contact(
+    *,
+    page: Page,
+    company: str,
+    cui: str,
+    county: str,
+    address: str,
+    query: str,
+) -> ContactResult | None:
+    panel_text = google_panel_text(page)
+    if not panel_text:
+        return None
+
+    identity_ok, panel_cuis, cui_match_status, identity_notes = identity_decision(
+        company,
+        cui,
+        county,
+        address,
+        panel_text,
+    )
+    if not identity_ok:
+        return None
+
+    emails = merge_contact_values(
+        collect_emails_from_text(panel_text, "google_panel", "")
+    )
+    phones = merge_contact_values(
+        collect_phones_from_text(panel_text, "google_panel")
+    )
+    if not emails and not phones:
+        return None
+
+    return ContactResult(
+        google_source="knowledge_panel",
+        google_title=company,
+        google_query=query,
+        panel_context=panel_text[:1000],
+        website_cuis=panel_cuis,
+        cui_match_status=cui_match_status,
+        email=emails[0].value if emails else "",
+        phone=phones[0].value if phones else "",
+        all_emails=[item.value for item in emails],
+        all_phones=[item.value for item in phones],
+        found_in="google_panel",
+        status="FOUND_GOOGLE_PANEL",
+        checked_at=datetime.now().isoformat(timespec="seconds"),
+        notes=f"Google panel identity verified; {identity_notes}",
+    )
+
+
 def extract_knowledge_panel_candidate(
     *,
     page: Page,
@@ -1207,7 +1304,12 @@ def discover_website(
     google_delay: float,
     name_frequency: Counter[str],
     assigned_domains: dict[str, set[str]],
-) -> tuple[GoogleCandidate | None, GoogleCandidate | None, bool]:
+) -> tuple[
+    GoogleCandidate | None,
+    GoogleCandidate | None,
+    bool,
+    ContactResult | None,
+]:
     best_review: GoogleCandidate | None = None
     google_blocked = False
     ambiguous = is_ambiguous_company(company, name_frequency)
@@ -1243,6 +1345,21 @@ def discover_website(
             continue
 
         # IMPORTANT: inspect the right-side company panel before organic results.
+        panel_contact = extract_google_panel_contact(
+            page=page,
+            company=company,
+            cui=cui,
+            county=county,
+            address=address,
+            query=query,
+        )
+        if panel_contact is not None:
+            print(
+                "    Knowledge panel contact ACCEPT: "
+                f"phone={panel_contact.phone or '-'}, "
+                f"email={panel_contact.email or '-'}"
+            )
+
         panel_candidate = extract_knowledge_panel_candidate(
             page=page,
             company=company,
@@ -1264,9 +1381,12 @@ def discover_website(
                 f"location={panel_candidate.location_score}"
             )
             if panel_candidate.accepted:
-                return panel_candidate, best_review, google_blocked
+                return panel_candidate, best_review, google_blocked, panel_contact
             if best_review is None or panel_candidate.score > best_review.score:
                 best_review = panel_candidate
+
+        if panel_contact is not None:
+            return None, best_review, google_blocked, panel_contact
 
         candidates = extract_organic_candidates(
             page=page,
@@ -1299,7 +1419,7 @@ def discover_website(
             None,
         )
         if accepted is not None:
-            return accepted, best_review, google_blocked
+            return accepted, best_review, google_blocked, None
 
         if candidates:
             candidate = candidates[0]
@@ -1309,7 +1429,7 @@ def discover_website(
         if query_number < len(queries):
             time.sleep(max(0.0, google_delay))
 
-    return None, best_review, google_blocked
+    return None, best_review, google_blocked, None
 
 
 def normalize_phone(raw: str) -> str:
@@ -2132,6 +2252,7 @@ def main() -> int:
                 if args.resume and existing_status:
                     retryable = existing_status in {
                         "NO_WEBSITE",
+                        "WEBSITE_NO_CONTACT",
                         "GOOGLE_BLOCKED",
                         "ERROR",
                         "REVIEW_GOOGLE_CANDIDATE",
@@ -2154,7 +2275,7 @@ def main() -> int:
                 checked_at = datetime.now().isoformat(timespec="seconds")
 
                 try:
-                    accepted, review, google_blocked = discover_website(
+                    accepted, review, google_blocked, panel_contact = discover_website(
                         page=page,
                         company=company,
                         cui=cui,
@@ -2177,6 +2298,10 @@ def main() -> int:
                             county,
                             address,
                         )
+                        if panel_contact is not None:
+                            result = merge_google_panel_contact(result, panel_contact)
+                    elif panel_contact is not None:
+                        result = panel_contact
                     elif review is not None:
                         if review.duplicate_cuis:
                             status = "REVIEW_DUPLICATE_DOMAIN"

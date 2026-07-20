@@ -68,7 +68,7 @@ from playwright.sync_api import (
     sync_playwright,
 )
 
-VERSION = "4.1"
+VERSION = "4.2"
 PROFILE_DIR = Path(__file__).parent / ".browser-profile"
 
 COMPANY_ALIASES = (
@@ -99,6 +99,8 @@ OUTPUT_COLUMNS = (
     "google_result_title",
     "google_query_used",
     "google_panel_context",
+    "website_cui",
+    "cui_match_status",
     "contact_page_url",
     "contact_email",
     "contact_phone",
@@ -119,6 +121,7 @@ STATUS_FILL_COLORS = {
     "REVIEW_GOOGLE_CANDIDATE": "FCE5CD",
     "REVIEW_DUPLICATE_DOMAIN": "FCE5CD",
     "REVIEW_AMBIGUOUS_NAME": "FCE5CD",
+    "REVIEW_CUI_MISMATCH": "FCE5CD",
     "NO_WEBSITE": "E7E6E6",
     "GOOGLE_BLOCKED": "FFF2CC",
     "ERROR": "F4CCCC",
@@ -379,6 +382,19 @@ PHONE_RE = re.compile(
     r"(?!\d)"
 )
 
+OBFUSCATED_EMAIL_RE = re.compile(
+    r"(?i)\b[a-z0-9._%+-]{1,64}\s*"
+    r"(?:@|\[\s*at\s*\]|\(\s*at\s*\)|\s+at\s+)\s*"
+    r"[a-z0-9-]+(?:\s*(?:\.|\[\s*dot\s*\]|\(\s*dot\s*\)|\s+dot\s+)"
+    r"\s*[a-z0-9-]+)+\b"
+)
+
+CUI_LABEL_RE = re.compile(
+    r"(?i)\b(?:c\.?\s*u\.?\s*i\.?|c\.?\s*i\.?\s*f\.?|"
+    r"cod(?:ul)?\s+(?:unic\s+de\s+[iî]nregistrare|fiscal))"
+    r"\s*(?:nr\.?|numar(?:ul)?)?\s*[:#-]?\s*(?:ro\s*)?(\d{2,10})\b"
+)
+
 
 @dataclass
 class GoogleCandidate:
@@ -415,6 +431,8 @@ class ContactResult:
     google_title: str = ""
     google_query: str = ""
     panel_context: str = ""
+    website_cuis: list[str] = field(default_factory=list)
+    cui_match_status: str = ""
     contact_page_url: str = ""
     email: str = ""
     phone: str = ""
@@ -620,6 +638,11 @@ def contains_cui(cui: str, text: str) -> bool:
     return bool(re.search(rf"(?<!\d){re.escape(cui)}(?!\d)", text))
 
 
+def extract_labeled_cuis(text: str) -> list[str]:
+    """Extract fiscal identifiers only when they have an explicit CUI/CIF label."""
+    return list(dict.fromkeys(match.group(1) for match in CUI_LABEL_RE.finditer(text)))
+
+
 def is_ambiguous_company(company: str, name_frequency: Counter[str]) -> bool:
     normalized = normalize_text(company)
     tokens = company_tokens(company)
@@ -693,15 +716,13 @@ def candidate_decision(
         reason = "excluded or invalid domain"
     elif duplicate_cuis:
         reason = "domain already assigned to another CUI"
+    elif source == "knowledge_panel":
+        # A Website/Site button in the company panel is strong enough to inspect.
+        # The website's footer/contact-page CUI is checked before its contacts
+        # are attached to the spreadsheet row.
+        accepted = True
     elif company_score < 65:
         reason = "company name does not match Google context"
-    elif source == "knowledge_panel":
-        # Google's Website button is strong evidence. Generic/ambiguous names
-        # still require the correct location or exact CUI in the panel.
-        if ambiguous and not (location_score >= 20 or cui_found):
-            reason = "ambiguous company name without matching location/CUI"
-        else:
-            accepted = True
     elif ambiguous:
         # Never accept APICOLA/MATCA-like organic matches from name/domain alone.
         if cui_found and domain_score >= 22 and score >= min_website_score:
@@ -829,6 +850,15 @@ def anchor_metadata(anchor: Locator) -> str:
                 """
                 (a) => {
                     const parts = [];
+                    if (a.textContent) parts.push(a.textContent);
+                    for (const child of a.querySelectorAll(
+                        '[aria-label], [title], [data-item-id], [data-attrid]'
+                    )) {
+                        for (const name of ['aria-label', 'title', 'data-item-id', 'data-attrid']) {
+                            const value = child.getAttribute(name);
+                            if (value) parts.push(value);
+                        }
+                    }
                     let node = a;
                     for (let depth = 0; depth < 6 && node; depth += 1) {
                         for (const name of ['data-attrid', 'aria-label', 'title', 'class', 'id']) {
@@ -899,15 +929,20 @@ def extract_knowledge_panel_candidate(
     name_frequency: Counter[str],
     assigned_domains: dict[str, set[str]],
 ) -> GoogleCandidate | None:
-    # data-item-id="authority" is used by current Google knowledge-panel
-    # website buttons. The aria-label selectors cover localized variants that
-    # may appear outside the traditional #rhs container.
+    # Google moves the visible Site/Website label between the link and nested
+    # button elements. Cover both layouts as well as the traditional #rhs.
     anchors = page.locator(
         '#rhs a[href], '
         '[role="complementary"] a[href], '
         '[data-attrid*="website"] a[href], '
         '[data-attrid*="official_site"] a[href], '
+        '[data-item-id*="authority"] a[href], '
+        'a[href]:has([data-item-id*="authority"]), '
         'a[href][data-item-id*="authority"], '
+        '[aria-label="site" i] a[href], '
+        '[aria-label*="website" i] a[href], '
+        'a[href]:has([aria-label="site" i]), '
+        'a[href]:has([aria-label*="website" i]), '
         'a[href][aria-label*="website" i], '
         'a[href][aria-label="site" i], '
         'a[href][aria-label*="site web" i], '
@@ -1162,6 +1197,8 @@ def discover_website(
 
 def normalize_phone(raw: str) -> str:
     digits = re.sub(r"\D+", "", raw)
+    if digits.startswith("400") and len(digits) == 12:
+        digits = digits[3:]
     if digits.startswith("0040"):
         digits = digits[4:]
     elif digits.startswith("40") and len(digits) == 11:
@@ -1186,6 +1223,23 @@ def valid_email(email: str) -> bool:
     ):
         return False
     return bool(local and "." in domain)
+
+
+def normalize_obfuscated_email(raw: str) -> str:
+    value = re.sub(r"(?i)\s*(?:\[\s*at\s*\]|\(\s*at\s*\)|\s+at\s+)\s*", "@", raw)
+    value = re.sub(r"(?i)\s*(?:\[\s*dot\s*\]|\(\s*dot\s*\)|\s+dot\s+)\s*", ".", value)
+    return re.sub(r"\s+", "", value).casefold()
+
+
+def decode_cloudflare_email(encoded: str) -> str:
+    try:
+        key = int(encoded[:2], 16)
+        return "".join(
+            chr(int(encoded[index:index + 2], 16) ^ key)
+            for index in range(2, len(encoded), 2)
+        ).casefold()
+    except (TypeError, ValueError):
+        return ""
 
 
 def email_score(email: str, source: str, website_domain: str) -> int:
@@ -1219,8 +1273,13 @@ def collect_emails_from_text(
     website_domain: str,
 ) -> list[ContactValue]:
     values: dict[str, ContactValue] = {}
-    for match in EMAIL_RE.finditer(text):
-        email = match.group(0).strip(" .,:;<>[](){}").casefold()
+    candidates = [match.group(0) for match in EMAIL_RE.finditer(text)]
+    candidates.extend(
+        normalize_obfuscated_email(match.group(0))
+        for match in OBFUSCATED_EMAIL_RE.finditer(text)
+    )
+    for raw_email in candidates:
+        email = raw_email.strip(" .,:;<>[](){}").casefold()
         if not valid_email(email):
             continue
         values[email] = ContactValue(
@@ -1254,6 +1313,20 @@ def collect_emails(
                     source=source,
                     score=email_score(email, source, website_domain) + 5,
                 )
+    except Exception:
+        pass
+    try:
+        protected = locator.locator("[data-cfemail]")
+        for index in range(min(protected.count(), 30)):
+            encoded = protected.nth(index).get_attribute("data-cfemail") or ""
+            email = decode_cloudflare_email(encoded)
+            if not valid_email(email):
+                continue
+            values[email] = ContactValue(
+                value=email,
+                source=source,
+                score=email_score(email, source, website_domain) + 5,
+            )
     except Exception:
         pass
     return list(values.values())
@@ -1299,20 +1372,28 @@ def collect_phones(
 
 
 def footer_locator(page: Page) -> Locator | None:
+    best: Locator | None = None
+    best_length = -1
     for selector in FOOTER_SELECTORS:
         locator = page.locator(selector)
         try:
-            if locator.count() > 0:
-                return locator.first
+            for index in range(min(locator.count(), 10)):
+                item = locator.nth(index)
+                if not item.is_visible():
+                    continue
+                length = len(safe_inner_text(item, timeout=2_000))
+                if length > best_length:
+                    best = item
+                    best_length = length
         except Exception:
             continue
-    return None
+    return best
 
 
 def footer_data(
     page: Page,
     website_domain: str,
-) -> tuple[list[ContactValue], list[ContactValue]]:
+) -> tuple[list[ContactValue], list[ContactValue], list[str]]:
     locator = footer_locator(page)
     if locator is not None:
         try:
@@ -1320,6 +1401,7 @@ def footer_data(
             return (
                 collect_emails(text, locator, "footer", website_domain),
                 collect_phones(text, locator, "footer"),
+                extract_labeled_cuis(text),
             )
         except Exception:
             pass
@@ -1331,9 +1413,10 @@ def footer_data(
         return (
             collect_emails_from_text(bottom_text, "footer", website_domain),
             collect_phones_from_text(bottom_text, "footer"),
+            extract_labeled_cuis(bottom_text),
         )
     except Exception:
-        return [], []
+        return [], [], []
 
 
 def contact_link_score(text: str, href: str) -> int:
@@ -1409,17 +1492,18 @@ def contact_page_data(
     page: Page,
     contact_url: str,
     website_domain: str,
-) -> tuple[list[ContactValue], list[ContactValue], str]:
+) -> tuple[list[ContactValue], list[ContactValue], list[str], str]:
     if not contact_url or not open_page(page, contact_url):
-        return [], [], ""
+        return [], [], [], ""
     try:
         body = page.locator("body")
         text = body.inner_text(timeout=15_000)
     except Exception:
-        return [], [], page.url
+        return [], [], [], page.url
     return (
         collect_emails(text, body, "contact_page", website_domain),
         collect_phones(text, body, "contact_page"),
+        extract_labeled_cuis(text),
         page.url,
     )
 
@@ -1433,7 +1517,11 @@ def merge_contact_values(values: list[ContactValue]) -> list[ContactValue]:
     return sorted(best.values(), key=lambda item: (-item.score, item.value))
 
 
-def inspect_selected_website(page: Page, candidate: GoogleCandidate) -> ContactResult:
+def inspect_selected_website(
+    page: Page,
+    candidate: GoogleCandidate,
+    expected_cui: str,
+) -> ContactResult:
     checked_at = datetime.now().isoformat(timespec="seconds")
     homepage = base_url(candidate.url)
     website_domain = candidate.domain
@@ -1460,7 +1548,7 @@ def inspect_selected_website(page: Page, candidate: GoogleCandidate) -> ContactR
 
     homepage = base_url(page.url)
     website_domain = canonical_domain(page.url) or website_domain
-    footer_emails, footer_phones = footer_data(page, website_domain)
+    footer_emails, footer_phones, footer_cuis = footer_data(page, website_domain)
     contact_url = discover_contact_url(
         page=page,
         website_domain=website_domain,
@@ -1469,27 +1557,43 @@ def inspect_selected_website(page: Page, candidate: GoogleCandidate) -> ContactR
 
     contact_emails: list[ContactValue] = []
     contact_phones: list[ContactValue] = []
+    contact_cuis: list[str] = []
     final_contact_url = ""
 
     if contact_url:
         print(f"  Opening contact page: {contact_url}")
-        contact_emails, contact_phones, final_contact_url = contact_page_data(
+        contact_emails, contact_phones, contact_cuis, final_contact_url = contact_page_data(
             page=page,
             contact_url=contact_url,
             website_domain=website_domain,
         )
     else:
-        print("  No contact-page link found on homepage.")
+        contact_url = urljoin(homepage, "/contact")
+        print(f"  No contact link found; trying standard path: {contact_url}")
+        contact_emails, contact_phones, contact_cuis, final_contact_url = contact_page_data(
+            page=page,
+            contact_url=contact_url,
+            website_domain=website_domain,
+        )
 
     emails = merge_contact_values(contact_emails + footer_emails)
     phones = merge_contact_values(contact_phones + footer_phones)
+    website_cuis = list(dict.fromkeys(contact_cuis + footer_cuis))
+    if expected_cui in website_cuis:
+        cui_match_status = "MATCH"
+    elif website_cuis:
+        cui_match_status = "MISMATCH"
+    else:
+        cui_match_status = "NOT_FOUND"
     sources: list[str] = []
     if contact_emails or contact_phones:
         sources.append("contact_page")
     if footer_emails or footer_phones:
         sources.append("footer")
 
-    if contact_emails or contact_phones:
+    if cui_match_status == "MISMATCH":
+        status = "REVIEW_CUI_MISMATCH"
+    elif contact_emails or contact_phones:
         status = "FOUND_CONTACT_PAGE"
     elif footer_emails or footer_phones:
         status = "FOUND_FOOTER"
@@ -1503,19 +1607,28 @@ def inspect_selected_website(page: Page, candidate: GoogleCandidate) -> ContactR
         google_title=candidate.title,
         google_query=candidate.query,
         panel_context=candidate.panel_context,
+        website_cuis=website_cuis,
+        cui_match_status=cui_match_status,
         contact_page_url=final_contact_url,
-        email=emails[0].value if emails else "",
-        phone=phones[0].value if phones else "",
-        all_emails=[item.value for item in emails],
-        all_phones=[item.value for item in phones],
-        found_in="; ".join(sources),
+        email=emails[0].value if emails and cui_match_status != "MISMATCH" else "",
+        phone=phones[0].value if phones and cui_match_status != "MISMATCH" else "",
+        all_emails=(
+            [item.value for item in emails] if cui_match_status != "MISMATCH" else []
+        ),
+        all_phones=(
+            [item.value for item in phones] if cui_match_status != "MISMATCH" else []
+        ),
+        found_in="; ".join(sources) if cui_match_status != "MISMATCH" else "",
         status=status,
         website_score=candidate.score,
         duplicate_cuis=candidate.duplicate_cuis,
         checked_at=checked_at,
         notes=(
-            "Website selected from Google's company panel or organic results; "
-            "only homepage footer and one discovered contact page were inspected"
+            "Website CUI differs from the searched company; contacts were not "
+            "attached to this row"
+            if cui_match_status == "MISMATCH"
+            else "Website selected from Google's company panel or organic results; "
+            "only homepage footer and one contact page were inspected"
         ),
     )
 
@@ -1588,6 +1701,8 @@ def write_result(
         "google_result_title": result.google_title,
         "google_query_used": result.google_query,
         "google_panel_context": result.panel_context,
+        "website_cui": "; ".join(result.website_cuis),
+        "cui_match_status": result.cui_match_status,
         "contact_page_url": result.contact_page_url,
         "contact_email": result.email,
         "contact_phone": result.phone,
@@ -1732,7 +1847,7 @@ def main() -> int:
     print(f"Output: {output_path}")
     print(f"Browser profile: {PROFILE_DIR}")
     print("Workflow: Google company panel first -> organic fallback -> one website")
-    print("Website inspection: homepage footer + one discovered contact page only")
+    print("Website inspection: homepage footer + one contact page + CUI check")
     print(
         f"Limits: companies={args.limit or 'all'}, "
         f"results/query={args.max_results}, "
@@ -1779,6 +1894,7 @@ def main() -> int:
                         "REVIEW_GOOGLE_CANDIDATE",
                         "REVIEW_DUPLICATE_DOMAIN",
                         "REVIEW_AMBIGUOUS_NAME",
+                        "REVIEW_CUI_MISMATCH",
                     }
                     if not (args.retry_failed and retryable):
                         continue
@@ -1808,7 +1924,7 @@ def main() -> int:
                     )
 
                     if accepted is not None:
-                        result = inspect_selected_website(page, accepted)
+                        result = inspect_selected_website(page, accepted, cui)
                     elif review is not None:
                         if review.duplicate_cuis:
                             status = "REVIEW_DUPLICATE_DOMAIN"

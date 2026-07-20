@@ -72,7 +72,7 @@ from playwright.sync_api import (
     sync_playwright,
 )
 
-VERSION = "4.16"
+VERSION = "4.17"
 PROFILE_DIR = Path(__file__).parent / ".browser-profile"
 
 COMPANY_ALIASES = (
@@ -2652,6 +2652,16 @@ def configure_worksheet_view(ws, header_row: int) -> None:
     ws.auto_filter.ref = f"A{header_row}:{last_column}{ws.max_row}"
 
 
+def close_browser_context_safely(context: BrowserContext) -> None:
+    try:
+        context.close()
+    except Exception as exc:
+        print(
+            "Browser was already closed during cleanup; "
+            f"saved workbook is unaffected ({type(exc).__name__})."
+        )
+
+
 def cell_text(ws, row: int, column: int | None) -> str:
     if column is None:
         return ""
@@ -3024,7 +3034,8 @@ def main() -> int:
             print("Interrupted. Saving current progress...")
         finally:
             workbook.save(output_path)
-            context.close()
+            print(f"  Progress saved: {output_path}")
+            close_browser_context_safely(context)
 
     print()
     print(f"Finished. Processed={processed}")

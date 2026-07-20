@@ -1,6 +1,12 @@
 [CmdletBinding()]
 param(
-    [string]$VenvDirectory = ".venv"
+    [string]$VenvDirectory = ".venv",
+
+    [ValidateSet("None", "Fresh", "Resume", "RetryFailed")]
+    [string]$RunMode = "None",
+
+    [ValidateRange(0, 2147483647)]
+    [int]$Limit = 20
 )
 
 $ErrorActionPreference = "Stop"
@@ -10,6 +16,8 @@ $repositoryRoot = Split-Path -Parent $MyInvocation.MyCommand.Path
 $venvPath = Join-Path $repositoryRoot $VenvDirectory
 $venvPython = Join-Path $venvPath "Scripts\python.exe"
 $requirementsPath = Join-Path $repositoryRoot "requirements.txt"
+$activateScript = Join-Path $venvPath "Scripts\Activate.ps1"
+$runnerScript = Join-Path $repositoryRoot "run_contacts.ps1"
 
 if (-not (Test-Path -LiteralPath $venvPython)) {
     Write-Host "Creating virtual environment at $venvPath"
@@ -61,5 +69,21 @@ if ($LASTEXITCODE -ne 0) {
 }
 
 Write-Host ""
-Write-Host "Setup complete. See README.md for fresh-run and resume commands."
+Write-Host "Activating the virtual environment"
+. $activateScript
 
+Write-Host "Setup complete."
+Write-Host "The virtual environment is active. To reactivate it in a later shell:"
+Write-Host "  .\$VenvDirectory\Scripts\Activate.ps1"
+Write-Host ""
+Write-Host "Start fresh with:"
+Write-Host "  .\run_contacts.ps1 -Mode Fresh -Limit $Limit"
+Write-Host "Resume with:"
+Write-Host "  .\run_contacts.ps1 -Mode Resume -Limit $Limit"
+Write-Host "Resume and retry failures/review rows with:"
+Write-Host "  .\run_contacts.ps1 -Mode RetryFailed -Limit $Limit"
+
+if ($RunMode -ne "None") {
+    Write-Host ""
+    & $runnerScript -Mode $RunMode -Limit $Limit -VenvDirectory $VenvDirectory
+}

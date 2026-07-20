@@ -70,7 +70,7 @@ from playwright.sync_api import (
     sync_playwright,
 )
 
-VERSION = "4.6"
+VERSION = "4.7"
 PROFILE_DIR = Path(__file__).parent / ".browser-profile"
 
 COMPANY_ALIASES = (
@@ -511,12 +511,49 @@ def normalize_cui(value: Any) -> str:
     return re.sub(r"\D+", "", text)
 
 
+def collapse_initial_tokens(value: str) -> list[str]:
+    result: list[str] = []
+    initials: list[str] = []
+
+    def flush_initials() -> None:
+        if initials:
+            result.append("".join(initials))
+            initials.clear()
+
+    for token in normalize_text(value).split():
+        if len(token) == 1 and token.isalpha():
+            initials.append(token)
+        else:
+            flush_initials()
+            result.append(token)
+    flush_initials()
+    return result
+
+
 def company_tokens(company: str) -> list[str]:
     return [
         token
-        for token in normalize_text(company).split()
+        for token in collapse_initial_tokens(clean_company_for_search(company))
         if len(token) >= 2 and token not in LEGAL_SUFFIXES
     ]
+
+
+def clean_company_for_search(company: str) -> str:
+    cleaned = re.sub(r"\s+", " ", company).strip()
+    cleaned = re.sub(r"\s*&\s*", "&", cleaned)
+    cleaned = re.sub(r"(?i)^s\.?\s*c\.?\s+", "", cleaned)
+    cleaned = re.sub(
+        r"(?i)\s+(?:s\.?\s*r\.?\s*l\.?|s\.?\s*a\.?)$",
+        "",
+        cleaned,
+    )
+    return cleaned.strip(" ,")
+
+
+def clean_address_for_search(address: str) -> str:
+    cleaned = re.sub(r"(?i)\b(?:nr|numar(?:ul)?)\.?\s*[:#-]?\s*", "", address)
+    cleaned = re.sub(r"[,;]+", " ", cleaned)
+    return re.sub(r"\s+", " ", cleaned).strip()
 
 
 def significant_company_tokens(company: str) -> list[str]:
@@ -633,6 +670,7 @@ def company_match_score(company: str, text: str) -> int:
         return 0
 
     haystack = set(normalize_text(text).split())
+    haystack.update(collapse_initial_tokens(text))
     matched = sum(token in haystack for token in tokens)
     ratio = matched / len(tokens)
 
@@ -844,10 +882,16 @@ def candidate_decision(
     elif duplicate_cuis and not verified_listing:
         reason = "domain already assigned to another CUI"
     elif source == "knowledge_panel":
-        # A Website/Site button in the company panel is strong enough to inspect.
-        # The landing page or website CUI is checked before its contacts are
-        # attached to the spreadsheet row.
-        accepted = True
+        if cui_found and company_score >= 65:
+            accepted = True
+        elif company_score >= 85 and address_identity_match(
+            county,
+            address,
+            combined,
+        ):
+            accepted = True
+        else:
+            reason = "knowledge panel lacks matching CUI or full name/address"
     elif source == "organic_listing":
         if cui_found and company_score >= 65:
             accepted = True
@@ -903,20 +947,14 @@ def build_google_queries(
     address: str,
     ambiguous: bool,
 ) -> list[str]:
-    clean_company = re.sub(r"\s+", " ", company).strip()
+    clean_company = clean_company_for_search(company)
     county_clean = re.sub(r"\s+", " ", county).strip()
+    clean_address = clean_address_for_search(address)
 
-    street = re.sub(r"\s+", " ", address.split(",", 1)[0]).strip()
-    street_number = address_street_number(address)
-    if street:
-        first_parts = [f'"{clean_company}"', f'"{street}"']
-        if street_number:
-            first_parts.append(f'"{street_number}"')
-        if county_clean:
-            first_parts.append(county_clean)
-        first_query = " ".join(first_parts)
-    else:
-        first_query = " ".join(part for part in (clean_company, county_clean) if part)
+    identity_phrase = " ".join(
+        part for part in (clean_company, clean_address, county_clean) if part
+    )
+    first_query = f'"{identity_phrase}"'
 
     exact_cui_query = f'"{clean_company}" "{cui}"'
     contact_terms = "(contact OR telefon OR email)"
@@ -1527,12 +1565,17 @@ def email_score(email: str, source: str, website_domain: str) -> int:
     return score
 
 
-def phone_score(phone: str, source: str) -> int:
+def phone_score(phone: str, source: str, context: str = "") -> int:
     score = 25 if source == "contact_page" else 15
     if phone.startswith(("+402", "+403")):
         score += 8
     elif phone.startswith("+407"):
         score += 5
+    normalized_context = normalize_text(context)
+    if "fax" in normalized_context:
+        score -= 35
+    elif any(label in normalized_context for label in ("tel", "telefon", "phone")):
+        score += 10
     return score
 
 
@@ -1603,14 +1646,15 @@ def collect_emails(
 
 def collect_phones_from_text(text: str, source: str) -> list[ContactValue]:
     values: dict[str, ContactValue] = {}
-    for match in PHONE_RE.finditer(text):
+    for index, match in enumerate(PHONE_RE.finditer(text)):
         phone = normalize_phone(match.group(0))
         if not phone:
             continue
+        nearby_text = text[max(0, match.start() - 40):match.start()]
         values[phone] = ContactValue(
             value=phone,
             source=source,
-            score=phone_score(phone, source),
+            score=phone_score(phone, source, nearby_text) + max(0, 10 - index),
         )
     return list(values.values())
 
@@ -1630,11 +1674,21 @@ def collect_phones(
             phone = normalize_phone(href[4:])
             if not phone:
                 continue
-            values[phone] = ContactValue(
+            candidate = ContactValue(
                 value=phone,
                 source=source,
-                score=phone_score(phone, source) + 5,
+                score=(
+                    phone_score(
+                        phone,
+                        source,
+                        safe_inner_text(links.nth(index), timeout=1_000),
+                    )
+                    + 5
+                ),
             )
+            existing = values.get(phone)
+            if existing is None or candidate.score > existing.score:
+                values[phone] = candidate
     except Exception:
         pass
     return list(values.values())
@@ -1764,6 +1818,10 @@ def contact_page_data(
 ) -> tuple[list[ContactValue], list[ContactValue], list[str], str, str]:
     if not contact_url or not open_page(page, contact_url):
         return [], [], [], "", ""
+    try:
+        page.wait_for_load_state("networkidle", timeout=5_000)
+    except Exception:
+        pass
     try:
         body = page.locator("body")
         text = body.inner_text(timeout=15_000)
@@ -1979,6 +2037,18 @@ def inspect_selected_website(
         expected_address,
         identity_text,
     )
+    if (
+        not identity_ok
+        and cui_match_status == "NOT_FOUND"
+        and candidate.cui_found
+        and candidate.company_score >= 65
+    ):
+        identity_ok = True
+        cui_match_status = "GOOGLE_MATCH"
+        identity_notes = (
+            "Exact CUI and company name matched the Google result for this domain; "
+            "the website publishes a different current address"
+        )
     sources: list[str] = []
     if contact_emails or contact_phones:
         sources.append("contact_page")

@@ -71,7 +71,7 @@ from playwright.sync_api import (
     sync_playwright,
 )
 
-VERSION = "4.9"
+VERSION = "4.10"
 PROFILE_DIR = Path(__file__).parent / ".browser-profile"
 
 COMPANY_ALIASES = (
@@ -786,11 +786,21 @@ def address_identity_match(county: str, address: str, text: str) -> bool:
     return matched_tokens >= 2 and county_found
 
 
-def stale_address_identity_match(county: str, address: str, text: str) -> bool:
+def stale_address_identity_match(
+    county: str,
+    address: str,
+    text: str,
+    corroborating_text: str = "",
+) -> bool:
     """Match the stable street/locality parts when an old street number changed."""
     normalized_text = normalize_text(text)
+    normalized_corroboration = normalize_text(corroborating_text)
     county_normalized = normalize_text(county)
-    if county_normalized and county_normalized not in normalized_text:
+    if (
+        county_normalized
+        and county_normalized not in normalized_text
+        and county_normalized not in normalized_corroboration
+    ):
         return False
 
     county_tokens = set(county_normalized.split())
@@ -846,6 +856,7 @@ def identity_decision(
     allow_stale_address: bool = False,
     ambiguous_company: bool = False,
     trusted_google_panel: bool = False,
+    corroborating_text: str = "",
 ) -> tuple[bool, list[str], str, str]:
     website_cuis = extract_labeled_cuis(text)
     if website_cuis:
@@ -869,7 +880,12 @@ def identity_decision(
             trusted_google_panel
             or domain_company_score(company, website_domain) >= 45
         )
-        and stale_address_identity_match(county, address, text)
+        and stale_address_identity_match(
+            county,
+            address,
+            text,
+            corroborating_text,
+        )
     ):
         return (
             True,
@@ -2070,6 +2086,7 @@ def inspect_selected_website(
     expected_county: str,
     expected_address: str,
     ambiguous_company: bool,
+    corroborating_identity_text: str = "",
 ) -> ContactResult:
     if is_verified_listing(candidate):
         return inspect_verified_listing(
@@ -2154,6 +2171,10 @@ def inspect_selected_website(
         website_domain=website_domain,
         allow_stale_address=True,
         ambiguous_company=ambiguous_company,
+        corroborating_text=(
+            f"{candidate.title}\n{candidate.snippet}\n"
+            f"{candidate.panel_context}\n{corroborating_identity_text}"
+        ),
     )
     if (
         not identity_ok
@@ -2531,6 +2552,7 @@ def main() -> int:
                             county,
                             address,
                             is_ambiguous_company(company, name_frequency),
+                            panel_contact.panel_context if panel_contact else "",
                         )
                         if inspected.status.startswith("FOUND_"):
                             result = inspected

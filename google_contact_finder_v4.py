@@ -71,7 +71,7 @@ from playwright.sync_api import (
     sync_playwright,
 )
 
-VERSION = "4.11"
+VERSION = "4.12"
 PROFILE_DIR = Path(__file__).parent / ".browser-profile"
 
 COMPANY_ALIASES = (
@@ -136,6 +136,19 @@ STATUS_FILL_COLORS = {
     "NO_WEBSITE": "E7E6E6",
     "GOOGLE_BLOCKED": "FFF2CC",
     "ERROR": "F4CCCC",
+}
+
+RETRYABLE_STATUSES = {
+    "NO_WEBSITE",
+    "WEBSITE_NO_CONTACT",
+    "GOOGLE_BLOCKED",
+    "ERROR",
+    "REVIEW_GOOGLE_CANDIDATE",
+    "REVIEW_DUPLICATE_DOMAIN",
+    "REVIEW_AMBIGUOUS_NAME",
+    "REVIEW_CUI_MISMATCH",
+    "REVIEW_PANEL_LISTING",
+    "REVIEW_IDENTITY_MISMATCH",
 }
 
 # Sources that may mention a company but are not its official website.
@@ -2506,6 +2519,20 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
+def should_skip_existing_result(
+    *,
+    resume: bool,
+    retry_failed: bool,
+    only_cui: str,
+    existing_status: str,
+) -> bool:
+    if not resume or not existing_status:
+        return False
+    if normalize_cui(only_cui):
+        return False
+    return not (retry_failed and existing_status in RETRYABLE_STATUSES)
+
+
 def main() -> int:
     args = parse_args()
     if args.input is None:
@@ -2589,21 +2616,13 @@ def main() -> int:
                 existing_status = cell_text(
                     ws, row, output_columns["contact_status"]
                 )
-                if args.resume and existing_status:
-                    retryable = existing_status in {
-                        "NO_WEBSITE",
-                        "WEBSITE_NO_CONTACT",
-                        "GOOGLE_BLOCKED",
-                        "ERROR",
-                        "REVIEW_GOOGLE_CANDIDATE",
-                        "REVIEW_DUPLICATE_DOMAIN",
-                        "REVIEW_AMBIGUOUS_NAME",
-                        "REVIEW_CUI_MISMATCH",
-                        "REVIEW_PANEL_LISTING",
-                        "REVIEW_IDENTITY_MISMATCH",
-                    }
-                    if not (args.retry_failed and retryable):
-                        continue
+                if should_skip_existing_result(
+                    resume=args.resume,
+                    retry_failed=args.retry_failed,
+                    only_cui=args.only_cui,
+                    existing_status=existing_status,
+                ):
+                    continue
 
                 if args.limit > 0 and processed >= args.limit:
                     break

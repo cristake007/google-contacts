@@ -71,7 +71,7 @@ from playwright.sync_api import (
     sync_playwright,
 )
 
-VERSION = "4.14"
+VERSION = "4.15"
 PROFILE_DIR = Path(__file__).parent / ".browser-profile"
 
 COMPANY_ALIASES = (
@@ -929,11 +929,16 @@ def assess_company_identity(
     raw_domain_score = domain_company_score(company, website_domain)
     domain_score = min(100, raw_domain_score * 2)
     if domain_score == 0 and website_domain:
-        domain_stem = normalize_text(
+        domain_tokens = normalize_text(
             website_domain.split(".", 1)[0]
-        ).replace(" ", "")
+        ).split()
+        domain_stem = "".join(domain_tokens)
         if any(
-            len(token) >= 4 and token.replace(" ", "") in domain_stem
+            len(token) >= 4
+            and (
+                token.replace(" ", "") in domain_stem
+                or fuzzy_token_present(token, domain_tokens, 0.86)
+            )
             for token in company_tokens(company)
         ):
             domain_score = 65
@@ -1602,13 +1607,32 @@ def extract_organic_candidates(
     )
 
 
-def ordered_accepted_candidates(
+def ordered_inspection_candidates(
     candidates: dict[str, GoogleCandidate],
 ) -> list[GoogleCandidate]:
     return sorted(
         candidates.values(),
         key=lambda item: (is_verified_listing(item), -item.score, item.rank),
     )[:6]
+
+
+def needs_onsite_identity_verification(
+    candidate: GoogleCandidate,
+    ambiguous_company: bool,
+) -> bool:
+    path_text = normalize_text(urlparse(candidate.url).path)
+    return (
+        ambiguous_company
+        and not candidate.accepted
+        and candidate.source == "organic_result"
+        and candidate.rank <= 3
+        and candidate.company_score >= 85
+        and not candidate.duplicate_cuis
+        and (
+            candidate.score >= 35
+            or any(hint in path_text for hint in CONTACT_LINK_HINTS)
+        )
+    )
 
 
 def is_decisive_panel_candidate(candidate: GoogleCandidate) -> bool:
@@ -1642,7 +1666,7 @@ def discover_website(
     ContactResult | None,
 ]:
     best_review: GoogleCandidate | None = None
-    accepted_candidates: dict[str, GoogleCandidate] = {}
+    inspection_candidates: dict[str, GoogleCandidate] = {}
     best_panel_contact: ContactResult | None = None
     google_blocked = False
     ambiguous = is_ambiguous_company(company, name_frequency)
@@ -1716,16 +1740,16 @@ def discover_website(
                 f"location={panel_candidate.location_score}"
             )
             if panel_candidate.accepted:
-                existing = accepted_candidates.get(panel_candidate.domain)
+                existing = inspection_candidates.get(panel_candidate.domain)
                 if existing is None or panel_candidate.score > existing.score:
-                    accepted_candidates[panel_candidate.domain] = panel_candidate
+                    inspection_candidates[panel_candidate.domain] = panel_candidate
                 if is_decisive_panel_candidate(panel_candidate):
                     print(
                         "    Decisive knowledge-panel website match; "
                         "stopping Google search."
                     )
                     return (
-                        ordered_accepted_candidates(accepted_candidates),
+                        ordered_inspection_candidates(inspection_candidates),
                         best_review,
                         google_blocked,
                         best_panel_contact,
@@ -1760,11 +1784,21 @@ def discover_website(
             )
 
         for candidate in candidates:
-            if not candidate.accepted:
+            if not (
+                candidate.accepted
+                or needs_onsite_identity_verification(candidate, ambiguous)
+            ):
                 continue
-            existing = accepted_candidates.get(candidate.domain)
+            if not candidate.accepted:
+                candidate.source = "organic_contact_listing"
+                candidate.rejection_reason = ""
+                print(
+                    "    Queued for onsite identity verification: "
+                    f"domain={candidate.domain}, rank={candidate.rank}"
+                )
+            existing = inspection_candidates.get(candidate.domain)
             if existing is None or candidate.score > existing.score:
-                accepted_candidates[candidate.domain] = candidate
+                inspection_candidates[candidate.domain] = candidate
 
         if candidates:
             candidate = candidates[0]
@@ -1775,7 +1809,7 @@ def discover_website(
             time.sleep(max(0.0, google_delay))
 
     return (
-        ordered_accepted_candidates(accepted_candidates),
+        ordered_inspection_candidates(inspection_candidates),
         best_review,
         google_blocked,
         best_panel_contact,
@@ -2091,10 +2125,45 @@ def open_page(page: Page, url: str) -> bool:
         return False
 
 
+def matching_contact_scope(
+    page: Page,
+    company: str,
+    county: str,
+    address: str,
+) -> tuple[Locator, str] | None:
+    """Find the table/card containing contacts for the expected branch."""
+    candidates = page.locator("tr, [role='row'], article")
+    best: tuple[Locator, str] | None = None
+    best_score = 0
+    try:
+        count = min(candidates.count(), 400)
+    except Exception:
+        count = 0
+
+    for index in range(count):
+        locator = candidates.nth(index)
+        text = safe_inner_text(locator, timeout=1_000)
+        if not 10 <= len(text) <= 2500:
+            continue
+        name_score = company_match_score(company, text)
+        branch_address_score = address_match_score(county, address, text)
+        branch_locality_score = locality_match_score(county, text)
+        if name_score < 65 or branch_address_score < 50:
+            continue
+        score = name_score + branch_address_score * 2 + branch_locality_score
+        if score > best_score:
+            best = (locator, text)
+            best_score = score
+    return best
+
+
 def contact_page_data(
     page: Page,
     contact_url: str,
     website_domain: str,
+    expected_company: str,
+    expected_county: str,
+    expected_address: str,
 ) -> tuple[list[ContactValue], list[ContactValue], list[str], str, str]:
     if not contact_url or not open_page(page, contact_url):
         return [], [], [], "", ""
@@ -2107,12 +2176,24 @@ def contact_page_data(
         text = body.inner_text(timeout=15_000)
     except Exception:
         return [], [], [], page.url, ""
+    matching_scope = matching_contact_scope(
+        page,
+        expected_company,
+        expected_county,
+        expected_address,
+    )
+    contact_locator, contact_text = matching_scope or (body, text)
     return (
-        collect_emails(text, body, "contact_page", website_domain),
-        collect_phones(text, body, "contact_page"),
-        extract_labeled_cuis(text),
+        collect_emails(
+            contact_text,
+            contact_locator,
+            "contact_page",
+            website_domain,
+        ),
+        collect_phones(contact_text, contact_locator, "contact_page"),
+        extract_labeled_cuis(contact_text),
         page.url,
-        text,
+        contact_text,
     )
 
 
@@ -2226,6 +2307,109 @@ def inspect_verified_listing(
     )
 
 
+def inspect_onsite_contact_listing(
+    page: Page,
+    candidate: GoogleCandidate,
+    expected_company: str,
+    expected_cui: str,
+    expected_county: str,
+    expected_address: str,
+) -> ContactResult:
+    checked_at = datetime.now().isoformat(timespec="seconds")
+    print(f"  Opening contact-listing result: {candidate.url}")
+    if not open_page(page, candidate.url):
+        return ContactResult(
+            candidate_url=candidate.url,
+            google_source=candidate.source,
+            google_rank=candidate.rank,
+            google_title=candidate.title,
+            google_query=candidate.query,
+            status="ERROR",
+            website_score=candidate.score,
+            checked_at=checked_at,
+            notes="Contact-listing candidate could not be opened",
+        )
+    try:
+        page.wait_for_load_state("networkidle", timeout=5_000)
+    except Exception:
+        pass
+
+    scope = matching_contact_scope(
+        page,
+        expected_company,
+        expected_county,
+        expected_address,
+    )
+    if scope is None:
+        return ContactResult(
+            candidate_url=candidate.url,
+            google_source=candidate.source,
+            google_rank=candidate.rank,
+            google_title=candidate.title,
+            google_query=candidate.query,
+            contact_page_url=normalize_url(page.url) or candidate.url,
+            status="REVIEW_IDENTITY_MISMATCH",
+            website_score=candidate.score,
+            checked_at=checked_at,
+            notes="No page row/card matched the expected company and address",
+        )
+
+    locator, text = scope
+    print("  Matching company/address row found; extracting only that row...")
+    assessment = assess_company_identity(
+        expected_company,
+        expected_cui,
+        expected_county,
+        expected_address,
+        text,
+        website_domain=candidate.domain,
+        ambiguous_company=True,
+        corroborating_text=f"{candidate.title}\n{candidate.snippet}",
+    )
+    emails = merge_contact_values(
+        collect_emails(text, locator, "verified_listing", candidate.domain)
+    )
+    phones = merge_contact_values(
+        collect_phones(text, locator, "verified_listing")
+    )
+    identity_ok = assessment.accepted
+    if not identity_ok and assessment.cui_status == "MISMATCH":
+        status = "REVIEW_CUI_MISMATCH"
+    elif not identity_ok:
+        status = "REVIEW_IDENTITY_MISMATCH"
+    elif emails or phones:
+        status = "FOUND_VERIFIED_LISTING"
+    else:
+        status = "WEBSITE_NO_CONTACT"
+
+    final_url = normalize_url(page.url) or candidate.url
+    return ContactResult(
+        candidate_url=candidate.url,
+        google_source=candidate.source,
+        google_rank=candidate.rank,
+        google_title=candidate.title,
+        google_query=candidate.query,
+        website_cuis=assessment.website_cuis,
+        cui_match_status=assessment.cui_status,
+        contact_page_url=final_url,
+        email=emails[0].value if emails and identity_ok else "",
+        phone=phones[0].value if phones and identity_ok else "",
+        all_emails=[item.value for item in emails] if identity_ok else [],
+        all_phones=[item.value for item in phones] if identity_ok else [],
+        found_in="verified_listing" if identity_ok else "",
+        status=status,
+        website_score=candidate.score,
+        identity_score=assessment.score,
+        identity_evidence=assessment.reason,
+        checked_at=checked_at,
+        notes=(
+            f"Matching contact-listing row verified; {assessment.reason}"
+            if identity_ok
+            else f"Contact-listing row rejected; {assessment.reason}"
+        ),
+    )
+
+
 def merge_contact_values(values: list[ContactValue]) -> list[ContactValue]:
     best: dict[str, ContactValue] = {}
     for item in values:
@@ -2245,6 +2429,15 @@ def inspect_selected_website(
     ambiguous_company: bool,
     corroborating_identity_text: str = "",
 ) -> ContactResult:
+    if candidate.source == "organic_contact_listing":
+        return inspect_onsite_contact_listing(
+            page,
+            candidate,
+            expected_company,
+            expected_cui,
+            expected_county,
+            expected_address,
+        )
     if is_verified_listing(candidate):
         return inspect_verified_listing(
             page,
@@ -2304,7 +2497,14 @@ def inspect_selected_website(
             _contact_cuis,
             final_contact_url,
             contact_identity_text,
-        ) = contact_page_data(page, contact_url, website_domain)
+        ) = contact_page_data(
+            page,
+            contact_url,
+            website_domain,
+            expected_company,
+            expected_county,
+            expected_address,
+        )
     else:
         contact_url = urljoin(homepage, "/contact")
         print(f"  No contact link found; trying standard path: {contact_url}")
@@ -2314,7 +2514,14 @@ def inspect_selected_website(
             _contact_cuis,
             final_contact_url,
             contact_identity_text,
-        ) = contact_page_data(page, contact_url, website_domain)
+        ) = contact_page_data(
+            page,
+            contact_url,
+            website_domain,
+            expected_company,
+            expected_county,
+            expected_address,
+        )
 
     emails = merge_contact_values(contact_emails + footer_emails)
     phones = merge_contact_values(contact_phones + footer_phones)

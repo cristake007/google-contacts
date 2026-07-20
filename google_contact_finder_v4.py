@@ -71,7 +71,7 @@ from playwright.sync_api import (
     sync_playwright,
 )
 
-VERSION = "4.13"
+VERSION = "4.14"
 PROFILE_DIR = Path(__file__).parent / ".browser-profile"
 
 COMPANY_ALIASES = (
@@ -1602,6 +1602,26 @@ def extract_organic_candidates(
     )
 
 
+def ordered_accepted_candidates(
+    candidates: dict[str, GoogleCandidate],
+) -> list[GoogleCandidate]:
+    return sorted(
+        candidates.values(),
+        key=lambda item: (is_verified_listing(item), -item.score, item.rank),
+    )[:6]
+
+
+def is_decisive_panel_candidate(candidate: GoogleCandidate) -> bool:
+    return (
+        candidate.accepted
+        and candidate.source == "knowledge_panel"
+        and candidate.score >= 95
+        and candidate.domain_score >= 32
+        and not candidate.duplicate_cuis
+        and not is_verified_listing(candidate)
+    )
+
+
 def discover_website(
     *,
     page: Page,
@@ -1699,6 +1719,17 @@ def discover_website(
                 existing = accepted_candidates.get(panel_candidate.domain)
                 if existing is None or panel_candidate.score > existing.score:
                     accepted_candidates[panel_candidate.domain] = panel_candidate
+                if is_decisive_panel_candidate(panel_candidate):
+                    print(
+                        "    Decisive knowledge-panel website match; "
+                        "stopping Google search."
+                    )
+                    return (
+                        ordered_accepted_candidates(accepted_candidates),
+                        best_review,
+                        google_blocked,
+                        best_panel_contact,
+                    )
             if best_review is None or panel_candidate.score > best_review.score:
                 best_review = panel_candidate
 
@@ -1743,11 +1774,12 @@ def discover_website(
         if query_number < len(queries):
             time.sleep(max(0.0, google_delay))
 
-    ordered_candidates = sorted(
-        accepted_candidates.values(),
-        key=lambda item: (is_verified_listing(item), -item.score, item.rank),
+    return (
+        ordered_accepted_candidates(accepted_candidates),
+        best_review,
+        google_blocked,
+        best_panel_contact,
     )
-    return ordered_candidates[:6], best_review, google_blocked, best_panel_contact
 
 
 def normalize_phone(raw: str) -> str:

@@ -40,9 +40,10 @@ PowerShell examples:
     & ".\\.venv\\Scripts\\python.exe" .\\google_contact_finder_v4.py `
       .\\all_cleaned.xlsx --resume --limit 20
 
-Requirements:
-    python -m pip install playwright openpyxl
-    python -m playwright install chromium
+First-time setup:
+    .\bootstrap.ps1
+
+See README.md for fresh-run, resume, and retry commands.
 """
 
 from __future__ import annotations

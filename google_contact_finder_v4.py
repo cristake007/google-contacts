@@ -7,14 +7,15 @@ Focused workflow:
 1. Search Google using company name plus location.
 2. Check Google's right-side company/knowledge panel FIRST for its Website link.
 3. If no reliable panel website exists, inspect the organic Google results.
-4. Select one likely official website.
-5. Open only the website homepage and one contact page discovered there.
-6. Extract contacts only from the contact page and homepage footer.
+4. Select one likely official website or an exact panel-linked business listing.
+5. Open only that landing page and, for official sites, one contact page.
+6. Extract contacts from the listing, contact page, or homepage footer.
 7. Save progress after every company and support resume.
 
 Accuracy safeguards:
 
-- Company directories, social networks and government portals are excluded.
+- Directories, social networks and government portals are excluded from organic
+  results. An exact listing linked by Google's company panel may be inspected.
 - Ambiguous names such as APICOLA or MATCA require location or CUI evidence.
 - A domain already assigned to another CUI is not silently reused.
 - Google result rank alone can never prove that a website is official.
@@ -69,7 +70,7 @@ from playwright.sync_api import (
     sync_playwright,
 )
 
-VERSION = "4.2"
+VERSION = "4.3"
 PROFILE_DIR = Path(__file__).parent / ".browser-profile"
 
 COMPANY_ALIASES = (
@@ -118,11 +119,13 @@ OUTPUT_COLUMNS = (
 STATUS_FILL_COLORS = {
     "FOUND_CONTACT_PAGE": "D9EAD3",
     "FOUND_FOOTER": "D9EAD3",
+    "FOUND_PANEL_LISTING": "D9EAD3",
     "WEBSITE_NO_CONTACT": "D9EAF7",
     "REVIEW_GOOGLE_CANDIDATE": "FCE5CD",
     "REVIEW_DUPLICATE_DOMAIN": "FCE5CD",
     "REVIEW_AMBIGUOUS_NAME": "FCE5CD",
     "REVIEW_CUI_MISMATCH": "FCE5CD",
+    "REVIEW_PANEL_LISTING": "FCE5CD",
     "NO_WEBSITE": "E7E6E6",
     "GOOGLE_BLOCKED": "FFF2CC",
     "ERROR": "F4CCCC",
@@ -563,6 +566,21 @@ def is_excluded_domain(domain: str) -> bool:
     )
 
 
+def is_google_domain(domain: str) -> bool:
+    return any(
+        domain == item or domain.endswith("." + item)
+        for item in ("google.com", "google.ro", "googleusercontent.com")
+    )
+
+
+def is_panel_listing(candidate: GoogleCandidate) -> bool:
+    return (
+        candidate.source == "knowledge_panel"
+        and is_excluded_domain(candidate.domain)
+        and not is_google_domain(candidate.domain)
+    )
+
+
 def company_match_score(company: str, text: str) -> int:
     tokens = company_tokens(company)
     if not tokens:
@@ -712,15 +730,22 @@ def candidate_decision(
     ambiguous = is_ambiguous_company(company, name_frequency)
     accepted = False
     reason = ""
+    panel_listing = (
+        source == "knowledge_panel"
+        and is_excluded_domain(domain)
+        and not is_google_domain(domain)
+    )
 
-    if not domain or is_excluded_domain(domain):
+    if not domain or is_google_domain(domain):
         reason = "excluded or invalid domain"
-    elif duplicate_cuis:
+    elif is_excluded_domain(domain) and not panel_listing:
+        reason = "excluded domain"
+    elif duplicate_cuis and not panel_listing:
         reason = "domain already assigned to another CUI"
     elif source == "knowledge_panel":
         # A Website/Site button in the company panel is strong enough to inspect.
-        # The website's footer/contact-page CUI is checked before its contacts
-        # are attached to the spreadsheet row.
+        # The landing page or website CUI is checked before its contacts are
+        # attached to the spreadsheet row.
         accepted = True
     elif company_score < 65:
         reason = "company name does not match Google context"
@@ -966,7 +991,9 @@ def extract_knowledge_panel_candidate(
         seen_urls.add(href)
 
         domain = canonical_domain(href)
-        if not domain or is_excluded_domain(domain):
+        # Exact Site links from the company panel may legitimately point to a
+        # directory listing. Organic candidates keep the exclusion rule.
+        if not domain or is_google_domain(domain):
             continue
 
         label = safe_inner_text(anchor, timeout=1_500)
@@ -1509,6 +1536,111 @@ def contact_page_data(
     )
 
 
+def primary_content_locator(page: Page) -> Locator:
+    selectors = (
+        "main",
+        "[role='main']",
+        "#main",
+        "#content",
+        "[itemtype*='LocalBusiness']",
+        "[class*='listing-detail']",
+        "[class*='company-detail']",
+    )
+    best: Locator | None = None
+    best_length = -1
+    for selector in selectors:
+        locator = page.locator(selector)
+        try:
+            for index in range(min(locator.count(), 12)):
+                item = locator.nth(index)
+                if not item.is_visible():
+                    continue
+                length = len(safe_inner_text(item, timeout=2_000))
+                if length > best_length:
+                    best = item
+                    best_length = length
+        except Exception:
+            continue
+    return best if best is not None else page.locator("body")
+
+
+def inspect_panel_listing(
+    page: Page,
+    candidate: GoogleCandidate,
+    expected_company: str,
+    expected_cui: str,
+) -> ContactResult:
+    checked_at = datetime.now().isoformat(timespec="seconds")
+    print(f"  Opening exact knowledge-panel listing: {candidate.url}")
+    if not open_page(page, candidate.url):
+        return ContactResult(
+            website=candidate.url,
+            google_source=candidate.source,
+            google_title=candidate.title,
+            google_query=candidate.query,
+            panel_context=candidate.panel_context,
+            status="ERROR",
+            website_score=candidate.score,
+            checked_at=checked_at,
+            notes="Knowledge-panel listing could not be opened",
+        )
+
+    content = primary_content_locator(page)
+    text = safe_inner_text(content, timeout=15_000)
+    company_score = company_match_score(expected_company, text)
+    website_domain = canonical_domain(page.url) or candidate.domain
+    emails = merge_contact_values(
+        collect_emails(text, content, "panel_listing", website_domain)
+    )
+    phones = merge_contact_values(collect_phones(text, content, "panel_listing"))
+    website_cuis = extract_labeled_cuis(text)
+
+    if expected_cui in website_cuis:
+        cui_match_status = "MATCH"
+    elif website_cuis:
+        cui_match_status = "MISMATCH"
+    else:
+        cui_match_status = "NOT_FOUND"
+
+    if cui_match_status == "MISMATCH":
+        status = "REVIEW_CUI_MISMATCH"
+        notes = "Panel listing CUI differs from the searched company"
+    elif company_score < 65:
+        status = "REVIEW_PANEL_LISTING"
+        notes = "Company name was not confirmed on the panel-linked listing"
+    elif emails or phones:
+        status = "FOUND_PANEL_LISTING"
+        notes = (
+            "Contacts extracted from the exact listing linked by Google's "
+            "Site button"
+        )
+    else:
+        status = "WEBSITE_NO_CONTACT"
+        notes = "No contact details found on the exact panel-linked listing"
+
+    keep_contacts = status == "FOUND_PANEL_LISTING"
+    final_url = normalize_url(page.url) or candidate.url
+    return ContactResult(
+        website=final_url,
+        google_source=candidate.source,
+        google_title=candidate.title,
+        google_query=candidate.query,
+        panel_context=candidate.panel_context,
+        website_cuis=website_cuis,
+        cui_match_status=cui_match_status,
+        contact_page_url=final_url,
+        email=emails[0].value if emails and keep_contacts else "",
+        phone=phones[0].value if phones and keep_contacts else "",
+        all_emails=[item.value for item in emails] if keep_contacts else [],
+        all_phones=[item.value for item in phones] if keep_contacts else [],
+        found_in="panel_listing" if keep_contacts else "",
+        status=status,
+        website_score=candidate.score,
+        checked_at=checked_at,
+        notes=notes,
+    )
+
+
 def merge_contact_values(values: list[ContactValue]) -> list[ContactValue]:
     best: dict[str, ContactValue] = {}
     for item in values:
@@ -1521,8 +1653,17 @@ def merge_contact_values(values: list[ContactValue]) -> list[ContactValue]:
 def inspect_selected_website(
     page: Page,
     candidate: GoogleCandidate,
+    expected_company: str,
     expected_cui: str,
 ) -> ContactResult:
+    if is_panel_listing(candidate):
+        return inspect_panel_listing(
+            page,
+            candidate,
+            expected_company,
+            expected_cui,
+        )
+
     checked_at = datetime.now().isoformat(timespec="seconds")
     homepage = base_url(candidate.url)
     website_domain = candidate.domain
@@ -1757,7 +1898,7 @@ def build_assigned_domain_map(
         status = cell_text(ws, row, output_columns["contact_status"])
         cui = normalize_cui(ws.cell(row, cui_column).value)
         domain = canonical_domain(website)
-        if not domain or not cui:
+        if not domain or not cui or is_excluded_domain(domain):
             continue
         if status.startswith("FOUND_") or status == "WEBSITE_NO_CONTACT":
             assigned[domain].add(cui)
@@ -1896,6 +2037,7 @@ def main() -> int:
                         "REVIEW_DUPLICATE_DOMAIN",
                         "REVIEW_AMBIGUOUS_NAME",
                         "REVIEW_CUI_MISMATCH",
+                        "REVIEW_PANEL_LISTING",
                     }
                     if not (args.retry_failed and retryable):
                         continue
@@ -1925,7 +2067,12 @@ def main() -> int:
                     )
 
                     if accepted is not None:
-                        result = inspect_selected_website(page, accepted, cui)
+                        result = inspect_selected_website(
+                            page,
+                            accepted,
+                            company,
+                            cui,
+                        )
                     elif review is not None:
                         if review.duplicate_cuis:
                             status = "REVIEW_DUPLICATE_DOMAIN"
@@ -1975,6 +2122,7 @@ def main() -> int:
 
                 if (
                     result.website
+                    and not is_excluded_domain(canonical_domain(result.website))
                     and (result.status.startswith("FOUND_") or result.status == "WEBSITE_NO_CONTACT")
                 ):
                     assigned_domains[canonical_domain(result.website)].add(cui)

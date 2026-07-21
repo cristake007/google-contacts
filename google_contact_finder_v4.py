@@ -73,7 +73,7 @@ from playwright.sync_api import (
     sync_playwright,
 )
 
-VERSION = "4.18"
+VERSION = "4.19"
 PROFILE_DIR = Path(__file__).parent / ".browser-profile"
 
 COMPANY_ALIASES = (
@@ -995,44 +995,40 @@ def assess_company_identity(
         # A logo-only site may omit its name from visible body text. Strongly
         # aligned domain and independent Google evidence can fill that one gap.
         name_score = 100 if trusted_cui_panel_association else 85
-    google_score = round(
-        corroborating_company * 0.75 + corroborating_location * 0.25
+    google_score = min(
+        100,
+        corroborating_company + round(corroborating_location * 0.25),
     )
     if contains_cui(cui, corroborating_text) or trusted_cui_panel_association:
         google_score = 100
 
+    # The workbook's company name and CUI are authoritative, while its address
+    # may be stale. Location therefore adds corroboration but never sits in the
+    # weighted denominator where a mismatch could reduce identity confidence.
     weighted_components = [
-        (name_score, 0.30),
-        (domain_score, 0.25),
+        (name_score, 0.45),
+        (domain_score, 0.35),
     ]
-    if address_tokens(address):
-        weighted_components.append((address_score, 0.20))
-    if normalize_text(county):
-        weighted_components.append((locality_score, 0.10))
     if normalize_text(corroborating_text):
-        weighted_components.append((google_score, 0.15))
+        weighted_components.append((google_score, 0.20))
     total_weight = sum(weight for _, weight in weighted_components)
-    score = round(
-        sum(value * weight for value, weight in weighted_components)
-        / total_weight
+    identity_score = round(
+        sum(value * weight for value, weight in weighted_components) / total_weight
     )
+    location_bonus = round(address_score * 0.10 + locality_score * 0.05)
+    score = min(100, identity_score + location_bonus)
     if ambiguous_company:
         threshold = 80
-    elif trusted_google_panel and name_score >= 85 and domain_score >= 70:
-        # The panel's Website action is independent evidence tying the domain
-        # to this named company. Country sites often publish a headquarters or
-        # older address instead of the work-point address in the spreadsheet.
-        threshold = 60
-    elif name_score >= 85 and domain_score >= 90:
-        # An exact distinctive company/domain pair can represent the corporate
-        # site even when Excel contains a branch address absent from the site.
-        threshold = 65
     else:
         threshold = 70
     accepted = (
         score >= threshold
         and name_score >= 65
-        and (address_score >= 50 or domain_score >= 70)
+        and (
+            domain_score >= 70
+            or google_score >= 70
+            or (name_score >= 85 and domain_score >= 40)
+        )
     )
     component_summary = (
         f"identity score {score}/{threshold} "
@@ -1041,15 +1037,8 @@ def assess_company_identity(
         f"CUI-panel={'yes' if trusted_cui_panel_association else 'no'})"
     )
     if accepted:
-        if address_tokens(address) and address_score < 100:
-            cui_status = "FUZZY_IDENTITY_MATCH"
-            reason = (
-                f"CUI not published; {component_summary}; address differences "
-                "were outweighed by the combined identity evidence"
-            )
-        else:
-            cui_status = "NOT_FOUND"
-            reason = f"CUI not published; {component_summary}"
+        cui_status = "NOT_FOUND"
+        reason = f"CUI not published; {component_summary}"
     else:
         cui_status = "NOT_FOUND"
         reason = f"CUI not published; insufficient {component_summary}"
@@ -1186,13 +1175,11 @@ def candidate_decision(
     elif company_score < 65:
         reason = "company name does not match Google context"
     elif ambiguous:
-        # Never accept APICOLA/MATCA-like organic matches from name/domain alone.
+        # Never use a possibly stale address to disambiguate identical names.
         if cui_found and domain_score >= 22 and score >= min_website_score:
             accepted = True
-        elif location_score >= 20 and domain_score >= 22 and score >= min_website_score:
-            accepted = True
         else:
-            reason = "ambiguous company name without location/CUI evidence"
+            reason = "ambiguous company name without CUI evidence"
     elif cui_found and domain_score >= 22 and score >= min_website_score:
         accepted = True
     elif domain_score >= 22 and score >= min_website_score:

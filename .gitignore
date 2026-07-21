@@ -1,4 +1,5 @@
 .venv/
+.env
 .browser-profile/
 __pycache__/
 *_google_contacts_v4.xlsx

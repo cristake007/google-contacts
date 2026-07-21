@@ -10,6 +10,7 @@ import re
 import sys
 import time
 import unicodedata
+from concurrent.futures import Future, ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -120,6 +121,21 @@ class Candidate:
     rank: int
     score: int
     occurrences: int = 1
+
+
+@dataclass(frozen=True)
+class SearchJob:
+    row: int
+    company: str
+    address: str
+    query: str
+
+
+@dataclass(frozen=True)
+class SearchOutcome:
+    job: SearchJob
+    values: dict[str, Any]
+    stop_run: bool = False
 
 
 class BraveApiError(RuntimeError):
@@ -365,14 +381,166 @@ def cell_text(worksheet, row: int, column: int | None) -> str:
 
 def save_workbook(workbook, output_path: Path) -> None:
     output_path.parent.mkdir(parents=True, exist_ok=True)
-    temporary_path = output_path.with_name(f".{output_path.name}.tmp")
-    workbook.save(temporary_path)
-    os.replace(temporary_path, output_path)
+    temporary_path = output_path.with_name(f".{output_path.stem}.tmp{output_path.suffix}")
+    try:
+        workbook.save(temporary_path)
+        os.replace(temporary_path, output_path)
+    except PermissionError as error:
+        raise PermissionError(
+            f"Cannot safely replace {output_path}. Close the workbook in Excel and run again."
+        ) from error
+    except KeyboardInterrupt:
+        # Finish a clean atomic save before honoring Ctrl+C. The existing output
+        # remains intact until os.replace succeeds.
+        workbook.save(temporary_path)
+        os.replace(temporary_path, output_path)
+        raise
 
 
 def write_values(worksheet, row: int, columns: dict[str, int], values: dict[str, Any]) -> None:
     for name in OUTPUT_HEADERS:
         worksheet.cell(row, columns[name], values.get(name, ""))
+
+
+def load_env_file(path: Path) -> None:
+    """Load simple KEY=VALUE entries without replacing existing environment values."""
+    if not path.exists():
+        return
+    try:
+        lines = path.read_text(encoding="utf-8-sig").splitlines()
+    except OSError as error:
+        raise ValueError(f"Could not read environment file {path}: {error}") from error
+
+    for line_number, raw_line in enumerate(lines, start=1):
+        line = raw_line.strip()
+        if not line or line.startswith("#"):
+            continue
+        if line.startswith("export "):
+            line = line[7:].lstrip()
+        if "=" not in line:
+            raise ValueError(f"Invalid .env entry on line {line_number}: expected KEY=VALUE")
+        name, value = line.split("=", 1)
+        name = name.strip()
+        if not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", name):
+            raise ValueError(f"Invalid .env variable name on line {line_number}")
+        value = value.strip()
+        if len(value) >= 2 and value[0] == value[-1] and value[0] in {'"', "'"}:
+            value = value[1:-1]
+        os.environ.setdefault(name, value)
+
+
+def search_company(api_key: str, timeout: float, job: SearchJob) -> SearchOutcome:
+    checked_at = datetime.now(timezone.utc).isoformat(timespec="seconds")
+    try:
+        # This is the only brave_search call for this job. A SearchJob is
+        # submitted once, and brave_search itself never retries.
+        results = brave_search(api_key, job.query, timeout)
+        selected, candidates = select_candidate(job.company, job.address, results)
+        if selected is None:
+            values = {
+                "brave_query": job.query,
+                "brave_status": "NO_DOMAIN",
+                "brave_checked_at": checked_at,
+                "brave_notes": f"No eligible company domain in {len(results)} web results",
+            }
+        else:
+            runner_up = candidates[1] if len(candidates) > 1 else None
+            confidence = confidence_for(selected, runner_up)
+            alternatives = ", ".join(
+                f"{item.domain} ({item.score})" for item in candidates[1:4]
+            )
+            values = {
+                "brave_domain": selected.domain,
+                "brave_url": selected.url,
+                "brave_confidence": confidence,
+                "brave_score": selected.score,
+                "brave_result_rank": selected.rank,
+                "brave_result_title": selected.title,
+                "brave_query": job.query,
+                "brave_status": "FOUND" if confidence != "LOW" else "REVIEW_LOW_CONFIDENCE",
+                "brave_checked_at": checked_at,
+                "brave_notes": f"Alternatives: {alternatives}" if alternatives else "",
+            }
+        return SearchOutcome(job=job, values=values)
+    except BraveApiError as error:
+        return SearchOutcome(
+            job=job,
+            values={
+                "brave_query": job.query,
+                "brave_status": "API_ERROR",
+                "brave_checked_at": checked_at,
+                "brave_notes": str(error),
+            },
+            stop_run=error.stop_run,
+        )
+
+
+def run_batch(
+    api_key: str,
+    timeout: float,
+    jobs: list[SearchJob],
+) -> tuple[list[SearchOutcome], bool]:
+    """Run each job once and return completed outcomes plus interrupt state."""
+    executor = ThreadPoolExecutor(max_workers=len(jobs), thread_name_prefix="brave-search")
+    future_jobs: dict[Future[SearchOutcome], SearchJob] = {
+        executor.submit(search_company, api_key, timeout, job): job for job in jobs
+    }
+    outcomes: list[SearchOutcome] = []
+    collected: set[Future[SearchOutcome]] = set()
+    interrupted = False
+
+    try:
+        for future in as_completed(future_jobs):
+            outcomes.append(future.result())
+            collected.add(future)
+    except KeyboardInterrupt:
+        interrupted = True
+        for future in future_jobs:
+            future.cancel()
+    finally:
+        # Running HTTP calls cannot be killed safely. Wait at most for their
+        # configured HTTP timeouts, then retain every completed result.
+        executor.shutdown(wait=True, cancel_futures=True)
+
+    if interrupted:
+        for future in future_jobs:
+            if future not in collected and future.done() and not future.cancelled():
+                outcomes.append(future.result())
+
+    outcomes.sort(key=lambda outcome: outcome.job.row)
+    return outcomes, interrupted
+
+
+def execute_and_save_batch(
+    api_key: str,
+    timeout: float,
+    jobs: list[SearchJob],
+    worksheet,
+    output_columns: dict[str, int],
+    workbook,
+    output_path: Path,
+    total_rows: int,
+) -> tuple[int, bool, bool]:
+    print(f"Starting batch of {len(jobs)} companies")
+    for job in jobs:
+        print(f"  [{job.row - 1}/{total_rows}] {job.query}")
+
+    outcomes, interrupted = run_batch(api_key, timeout, jobs)
+    stop_run = False
+    for outcome in outcomes:
+        write_values(worksheet, outcome.job.row, output_columns, outcome.values)
+        status = str(outcome.values.get("brave_status") or "")
+        domain = str(outcome.values.get("brave_domain") or "-")
+        print(f"  row {outcome.job.row}: {status} | domain={domain}")
+        if status == "API_ERROR":
+            print(f"    {outcome.values.get('brave_notes', '')}", file=sys.stderr)
+        stop_run = stop_run or outcome.stop_run
+
+    # Only the main thread touches openpyxl. A batch becomes durable before the
+    # next batch is allowed to start.
+    save_workbook(workbook, output_path)
+    print(f"Batch saved: {len(outcomes)}/{len(jobs)} completed")
+    return len(outcomes), interrupted, stop_run
 
 
 def parse_args() -> argparse.Namespace:
@@ -387,20 +555,41 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--resume", action="store_true", help="Continue from an existing output workbook")
     parser.add_argument("--limit", type=int, default=0, help="Maximum API queries; 0 means all")
     parser.add_argument("--only-cui", help="Process only the row with this CUI")
-    parser.add_argument("--delay", type=float, default=0.1, help="Seconds between companies")
+    parser.add_argument(
+        "--batch-size",
+        type=int,
+        default=5,
+        help="Companies searched concurrently per batch (default: 5)",
+    )
+    parser.add_argument("--delay", type=float, default=0.1, help="Seconds between batches")
     parser.add_argument("--timeout", type=float, default=30.0, help="HTTP timeout in seconds")
     return parser.parse_args()
 
 
 def main() -> int:
     args = parse_args()
-    if args.limit < 0 or args.delay < 0 or args.timeout <= 0:
-        print("--limit and --delay cannot be negative; --timeout must be positive", file=sys.stderr)
+    if (
+        args.limit < 0
+        or not 1 <= args.batch_size <= 50
+        or args.delay < 0
+        or args.timeout <= 0
+    ):
+        print(
+            "--limit and --delay cannot be negative; --batch-size must be 1-50; "
+            "--timeout must be positive",
+            file=sys.stderr,
+        )
+        return 2
+
+    try:
+        load_env_file(Path(__file__).with_name(".env"))
+    except ValueError as error:
+        print(str(error), file=sys.stderr)
         return 2
 
     api_key = os.environ.get("BRAVE_API_KEY", "").strip()
     if not api_key:
-        print("Set the BRAVE_API_KEY environment variable before running the script.", file=sys.stderr)
+        print("Set BRAVE_API_KEY in .env or in the environment before running the script.", file=sys.stderr)
         return 2
 
     input_path = args.input.resolve()
@@ -429,12 +618,27 @@ def main() -> int:
         print(str(error), file=sys.stderr)
         return 2
 
-    queries_made = 0
+    worksheet.freeze_panes = "A2"
+    worksheet.auto_filter.ref = f"A1:{get_column_letter(worksheet.max_column)}{worksheet.max_row}"
+    try:
+        # Fail before consuming quota if Excel has the output file locked.
+        save_workbook(workbook, output_path)
+    except PermissionError as error:
+        print(str(error), file=sys.stderr)
+        return 2
+    except KeyboardInterrupt:
+        print("\nStopped before any queries were made.", file=sys.stderr)
+        return 130
+
+    queries_scheduled = 0
+    queries_completed = 0
     stopped_early = False
+    interrupted = False
+    pending_jobs: list[SearchJob] = []
 
     try:
         for row in range(2, worksheet.max_row + 1):
-            if args.limit and queries_made >= args.limit:
+            if args.limit and queries_scheduled >= args.limit:
                 break
             if args.only_cui and cell_text(worksheet, row, cui_column) != args.only_cui.strip():
                 continue
@@ -456,70 +660,66 @@ def main() -> int:
                 continue
 
             query = f"{company} {address}"
-            print(f"[{row - 1}/{worksheet.max_row - 1}] {query}")
-            checked_at = datetime.now(timezone.utc).isoformat(timespec="seconds")
-            queries_made += 1
-
-            try:
-                results = brave_search(api_key, query, args.timeout)
-                selected, candidates = select_candidate(company, address, results)
-                if selected is None:
-                    values = {
-                        "brave_query": query,
-                        "brave_status": "NO_DOMAIN",
-                        "brave_checked_at": checked_at,
-                        "brave_notes": f"No eligible company domain in {len(results)} web results",
-                    }
-                else:
-                    runner_up = candidates[1] if len(candidates) > 1 else None
-                    confidence = confidence_for(selected, runner_up)
-                    alternatives = ", ".join(
-                        f"{item.domain} ({item.score})" for item in candidates[1:4]
-                    )
-                    values = {
-                        "brave_domain": selected.domain,
-                        "brave_url": selected.url,
-                        "brave_confidence": confidence,
-                        "brave_score": selected.score,
-                        "brave_result_rank": selected.rank,
-                        "brave_result_title": selected.title,
-                        "brave_query": query,
-                        "brave_status": "FOUND" if confidence != "LOW" else "REVIEW_LOW_CONFIDENCE",
-                        "brave_checked_at": checked_at,
-                        "brave_notes": f"Alternatives: {alternatives}" if alternatives else "",
-                    }
-                write_values(worksheet, row, output_columns, values)
-            except BraveApiError as error:
-                write_values(
-                    worksheet,
-                    row,
-                    output_columns,
-                    {
-                        "brave_query": query,
-                        "brave_status": "API_ERROR",
-                        "brave_checked_at": checked_at,
-                        "brave_notes": str(error),
-                    },
+            pending_jobs.append(
+                SearchJob(
+                    row=row,
+                    company=company,
+                    address=address,
+                    query=query,
                 )
-                print(f"  {error}", file=sys.stderr)
-                if error.stop_run:
-                    stopped_early = True
+            )
+            queries_scheduled += 1
 
-            save_workbook(workbook, output_path)
-            if stopped_early:
-                print("Stopping to avoid further requests after an authentication or rate-limit error.", file=sys.stderr)
-                break
-            if args.delay:
-                time.sleep(args.delay)
+            if len(pending_jobs) >= args.batch_size:
+                completed, interrupted, stopped_early = execute_and_save_batch(
+                    api_key,
+                    args.timeout,
+                    pending_jobs,
+                    worksheet,
+                    output_columns,
+                    workbook,
+                    output_path,
+                    worksheet.max_row - 1,
+                )
+                queries_completed += completed
+                pending_jobs = []
+                if interrupted or stopped_early:
+                    break
+                if args.delay:
+                    time.sleep(args.delay)
+
+        if pending_jobs and not interrupted and not stopped_early:
+            completed, interrupted, stopped_early = execute_and_save_batch(
+                api_key,
+                args.timeout,
+                pending_jobs,
+                worksheet,
+                output_columns,
+                workbook,
+                output_path,
+                worksheet.max_row - 1,
+            )
+            queries_completed += completed
     except KeyboardInterrupt:
         save_workbook(workbook, output_path)
-        print("\nStopped; progress was saved.", file=sys.stderr)
-        return 130
+        interrupted = True
+    except PermissionError as error:
+        print(str(error), file=sys.stderr)
+        return 2
 
-    worksheet.freeze_panes = "A2"
-    worksheet.auto_filter.ref = f"A1:{get_column_letter(worksheet.max_column)}{worksheet.max_row}"
-    save_workbook(workbook, output_path)
-    print(f"Saved {queries_made} queried companies to {output_path}")
+    try:
+        save_workbook(workbook, output_path)
+    except PermissionError as error:
+        print(str(error), file=sys.stderr)
+        return 2
+    except KeyboardInterrupt:
+        interrupted = True
+    if interrupted:
+        print(f"\nStopped safely; {queries_completed} completed queries were saved to {output_path}", file=sys.stderr)
+        return 130
+    if stopped_early:
+        print("Stopping after an authentication, validation, or rate-limit error.", file=sys.stderr)
+    print(f"Saved {queries_completed} queried companies to {output_path}")
     return 1 if stopped_early else 0
 
 

@@ -73,7 +73,7 @@ from playwright.sync_api import (
     sync_playwright,
 )
 
-VERSION = "4.19"
+VERSION = "4.20"
 PROFILE_DIR = Path(__file__).parent / ".browser-profile"
 
 COMPANY_ALIASES = (
@@ -145,6 +145,7 @@ OUTPUT_COLUMNS = (
 
 STATUS_FILL_COLORS = {
     "FOUND_CONTACT_PAGE": "D9EAD3",
+    "FOUND_HOMEPAGE": "D9EAD3",
     "FOUND_FOOTER": "D9EAD3",
     "FOUND_PANEL_LISTING": "D9EAD3",
     "FOUND_VERIFIED_LISTING": "D9EAD3",
@@ -243,6 +244,17 @@ EXCLUDED_DOMAINS = {
     "rrf.ro",
     "wikimapia.org",
     "waze.com",
+    "scribd.com",
+    "mfirme.ro",
+    "anuntul.ro",
+    "pregatire.net",
+    "leadrar.ro",
+    "ejobs.ro",
+    "bizinfo.ro",
+    "supervizor.ro",
+    "euroinsol.eu",
+    "lege6.ro",
+    "radarfirme.ro",
 
     # Marketplaces can mention a seller's exact legal name, CUI and address,
     # but that does not make the marketplace the seller's official website.
@@ -1149,15 +1161,17 @@ def candidate_decision(
         ):
             accepted = True
         elif (
-            not ambiguous
-            and company_score >= 85
+            (
+                (score == 100 and company_score >= 35)
+                or (not ambiguous and company_score >= 85)
+            )
             and domain_score >= 22
             and score >= min_website_score
         ):
             # Google's Website action explicitly associates this domain with
-            # the named entity. For a distinctive company, name and domain
-            # overlap are enough to inspect the site even when the panel omits
-            # the spreadsheet's CUI or branch address.
+            # the named entity. A saturated match with strong name/domain
+            # overlap is decisive even when duplicate legal names made the
+            # spreadsheet-level ambiguity check conservative.
             accepted = True
         else:
             reason = "knowledge panel lacks matching CUI or full name/address"
@@ -1679,7 +1693,10 @@ def is_decisive_panel_candidate(candidate: GoogleCandidate) -> bool:
         candidate.accepted
         and candidate.source == "knowledge_panel"
         and candidate.score >= 95
-        and candidate.company_score >= 85
+        and (
+            (candidate.score == 100 and candidate.company_score >= 35)
+            or candidate.company_score >= 85
+        )
         and candidate.domain_score >= 22
         and not candidate.duplicate_cuis
         and not is_verified_listing(candidate)
@@ -1967,7 +1984,14 @@ def email_score(email: str, source: str, website_domain: str) -> int:
 
 
 def phone_score(phone: str, source: str, context: str = "") -> int:
-    score = 25 if source == "contact_page" else 15
+    if source == "contact_page":
+        score = 25
+    elif source == "footer":
+        score = 20
+    elif source == "homepage":
+        score = 10
+    else:
+        score = 15
     if phone.startswith(("+402", "+403")):
         score += 8
     elif phone.startswith("+407"):
@@ -2582,8 +2606,22 @@ def inspect_selected_website(
 
     homepage = base_url(page.url)
     website_domain = canonical_domain(page.url) or website_domain
-    homepage_identity_text = safe_inner_text(page.locator("body"), timeout=15_000)
-    footer_emails, footer_phones, _footer_cuis = footer_data(page, website_domain)
+    homepage_body = page.locator("body")
+    homepage_identity_text = safe_inner_text(homepage_body, timeout=15_000)
+    homepage_emails = collect_emails(
+        homepage_identity_text,
+        homepage_body,
+        "homepage",
+        website_domain,
+    )
+    homepage_phones = collect_phones(
+        homepage_identity_text,
+        homepage_body,
+        "homepage",
+    )
+    homepage_footer_emails, homepage_footer_phones, _homepage_footer_cuis = (
+        footer_data(page, website_domain)
+    )
     contact_url = discover_contact_url(
         page=page,
         website_domain=website_domain,
@@ -2592,6 +2630,8 @@ def inspect_selected_website(
 
     contact_emails: list[ContactValue] = []
     contact_phones: list[ContactValue] = []
+    contact_footer_emails: list[ContactValue] = []
+    contact_footer_phones: list[ContactValue] = []
     _contact_cuis: list[str] = []
     final_contact_url = ""
     contact_identity_text = ""
@@ -2630,8 +2670,23 @@ def inspect_selected_website(
             expected_address,
         )
 
-    emails = merge_contact_values(contact_emails + footer_emails)
-    phones = merge_contact_values(contact_phones + footer_phones)
+    if final_contact_url:
+        contact_footer_emails, contact_footer_phones, _contact_footer_cuis = (
+            footer_data(page, website_domain)
+        )
+
+    emails = merge_contact_values(
+        homepage_emails
+        + homepage_footer_emails
+        + contact_emails
+        + contact_footer_emails
+    )
+    phones = merge_contact_values(
+        homepage_phones
+        + homepage_footer_phones
+        + contact_phones
+        + contact_footer_phones
+    )
     identity_text = f"{homepage_identity_text}\n{contact_identity_text}"
     assessment = assess_company_identity(
         expected_company,
@@ -2653,18 +2708,29 @@ def inspect_selected_website(
     )
     identity_ok = assessment.accepted
     sources: list[str] = []
+    if homepage_emails or homepage_phones:
+        sources.append("homepage")
+    if homepage_footer_emails or homepage_footer_phones:
+        sources.append("homepage_footer")
     if contact_emails or contact_phones:
         sources.append("contact_page")
-    if footer_emails or footer_phones:
-        sources.append("footer")
+    if contact_footer_emails or contact_footer_phones:
+        sources.append("contact_page_footer")
 
     if not identity_ok and assessment.cui_status == "MISMATCH":
         status = "REVIEW_CUI_MISMATCH"
     elif not identity_ok:
         status = "REVIEW_IDENTITY_MISMATCH"
-    elif contact_emails or contact_phones:
+    elif (
+        contact_emails
+        or contact_phones
+        or contact_footer_emails
+        or contact_footer_phones
+    ):
         status = "FOUND_CONTACT_PAGE"
-    elif footer_emails or footer_phones:
+    elif homepage_emails or homepage_phones:
+        status = "FOUND_HOMEPAGE"
+    elif homepage_footer_emails or homepage_footer_phones:
         status = "FOUND_FOOTER"
     else:
         status = "WEBSITE_NO_CONTACT"
@@ -2699,7 +2765,8 @@ def inspect_selected_website(
             f"Contacts rejected: {assessment.reason}"
             if not identity_ok
             else "Website identity verified; "
-            f"{assessment.reason}; homepage footer and one contact page inspected"
+            f"{assessment.reason}; homepage body/footer and contact page "
+            "body/footer inspected"
         ),
     )
 

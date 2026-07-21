@@ -8,7 +8,6 @@ import json
 import os
 import re
 import sys
-import time
 import unicodedata
 from concurrent.futures import Future, ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
@@ -519,11 +518,10 @@ def execute_and_save_batch(
     output_columns: dict[str, int],
     workbook,
     output_path: Path,
-    total_rows: int,
 ) -> tuple[int, bool, bool]:
     print(f"Starting batch of {len(jobs)} companies")
     for job in jobs:
-        print(f"  [{job.row - 1}/{total_rows}] {job.query}")
+        print(f"  [Excel row {job.row}] {job.query}")
 
     outcomes, interrupted = run_batch(api_key, timeout, jobs)
     stop_run = False
@@ -553,15 +551,19 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("input", nargs="?", type=Path, default=DEFAULT_INPUT)
     parser.add_argument("--output", type=Path, default=DEFAULT_OUTPUT)
     parser.add_argument("--resume", action="store_true", help="Continue from an existing output workbook")
-    parser.add_argument("--limit", type=int, default=0, help="Maximum API queries; 0 means all")
+    parser.add_argument(
+        "--limit",
+        type=int,
+        default=0,
+        help="Optional lower query limit; 0 means use --batch-size",
+    )
     parser.add_argument("--only-cui", help="Process only the row with this CUI")
     parser.add_argument(
         "--batch-size",
         type=int,
         default=5,
-        help="Companies searched concurrently per batch (default: 5)",
+        help="Maximum companies searched in this run (default: 5)",
     )
-    parser.add_argument("--delay", type=float, default=0.1, help="Seconds between batches")
     parser.add_argument("--timeout", type=float, default=30.0, help="HTTP timeout in seconds")
     return parser.parse_args()
 
@@ -571,11 +573,10 @@ def main() -> int:
     if (
         args.limit < 0
         or not 1 <= args.batch_size <= 50
-        or args.delay < 0
         or args.timeout <= 0
     ):
         print(
-            "--limit and --delay cannot be negative; --batch-size must be 1-50; "
+            "--limit cannot be negative; --batch-size must be 1-50; "
             "--timeout must be positive",
             file=sys.stderr,
         )
@@ -609,10 +610,7 @@ def main() -> int:
         headers = header_map(worksheet)
         company_column = require_column(headers, COMPANY_HEADER)
         address_column = require_column(headers, ADDRESS_HEADER)
-        cui_column = next(
-            (headers[normalize_text(name)] for name in CUI_HEADERS if normalize_text(name) in headers),
-            None,
-        )
+        cui_column = require_column(headers, CUI_HEADERS[0])
         output_columns = ensure_output_columns(worksheet)
     except (OSError, ValueError) as error:
         print(str(error), file=sys.stderr)
@@ -635,10 +633,11 @@ def main() -> int:
     stopped_early = False
     interrupted = False
     pending_jobs: list[SearchJob] = []
+    run_limit = min(args.limit, args.batch_size) if args.limit else args.batch_size
 
     try:
         for row in range(2, worksheet.max_row + 1):
-            if args.limit and queries_scheduled >= args.limit:
+            if queries_scheduled >= run_limit:
                 break
             if args.only_cui and cell_text(worksheet, row, cui_column) != args.only_cui.strip():
                 continue
@@ -647,6 +646,7 @@ def main() -> int:
 
             company = cell_text(worksheet, row, company_column)
             address = cell_text(worksheet, row, address_column)
+            cui = cell_text(worksheet, row, cui_column)
             if not company or not address:
                 write_values(
                     worksheet,
@@ -659,7 +659,7 @@ def main() -> int:
                 )
                 continue
 
-            query = f"{company} {address}"
+            query = " ".join(value for value in (company, address, cui) if value)
             pending_jobs.append(
                 SearchJob(
                     row=row,
@@ -670,24 +670,6 @@ def main() -> int:
             )
             queries_scheduled += 1
 
-            if len(pending_jobs) >= args.batch_size:
-                completed, interrupted, stopped_early = execute_and_save_batch(
-                    api_key,
-                    args.timeout,
-                    pending_jobs,
-                    worksheet,
-                    output_columns,
-                    workbook,
-                    output_path,
-                    worksheet.max_row - 1,
-                )
-                queries_completed += completed
-                pending_jobs = []
-                if interrupted or stopped_early:
-                    break
-                if args.delay:
-                    time.sleep(args.delay)
-
         if pending_jobs and not interrupted and not stopped_early:
             completed, interrupted, stopped_early = execute_and_save_batch(
                 api_key,
@@ -697,7 +679,6 @@ def main() -> int:
                 output_columns,
                 workbook,
                 output_path,
-                worksheet.max_row - 1,
             )
             queries_completed += completed
     except KeyboardInterrupt:

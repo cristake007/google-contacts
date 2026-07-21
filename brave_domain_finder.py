@@ -272,7 +272,10 @@ def brave_search(api_key: str, query: str, timeout: float) -> list[dict[str, Any
     parameters = urlencode(
         {
             "q": query,
-            "country": "RO",
+            # Brave does not offer RO as a web-search market. ALL avoids the
+            # default US market, while X-Loc-Country below supplies the
+            # Romanian location bias using the full ISO country list.
+            "country": "ALL",
             "search_lang": "ro",
             "count": 20,
             "result_filter": "web",
@@ -286,6 +289,7 @@ def brave_search(api_key: str, query: str, timeout: float) -> list[dict[str, Any
             "Accept": "application/json",
             "Accept-Encoding": "identity",
             "X-Subscription-Token": api_key,
+            "X-Loc-Country": "RO",
             "User-Agent": "brave-domain-finder/1.0",
         },
     )
@@ -294,8 +298,26 @@ def brave_search(api_key: str, query: str, timeout: float) -> list[dict[str, Any
         with urlopen(request, timeout=timeout) as response:
             payload = json.load(response)
     except HTTPError as error:
-        stop_run = error.code in {401, 403, 429}
-        raise BraveApiError(f"Brave API returned HTTP {error.code}", stop_run=stop_run) from error
+        response_body = error.read(2_048).decode("utf-8", errors="replace").strip()
+        detail = ""
+        if response_body:
+            try:
+                error_payload = json.loads(response_body)
+                api_error = error_payload.get("error", {})
+                if isinstance(api_error, dict):
+                    detail = str(api_error.get("detail") or api_error.get("message") or "").strip()
+                    if not detail and api_error.get("meta"):
+                        detail = json.dumps(api_error["meta"], ensure_ascii=False, separators=(",", ":"))
+                if not detail:
+                    detail = str(error_payload.get("message") or "").strip()
+            except (json.JSONDecodeError, AttributeError):
+                detail = response_body
+        detail = re.sub(r"\s+", " ", detail)[:500]
+        message = f"Brave API returned HTTP {error.code}"
+        if detail:
+            message += f": {detail}"
+        stop_run = 400 <= error.code < 500
+        raise BraveApiError(message, stop_run=stop_run) from error
     except (URLError, TimeoutError, json.JSONDecodeError) as error:
         raise BraveApiError(f"Brave API request failed: {error}") from error
 

@@ -73,7 +73,7 @@ from playwright.sync_api import (
     sync_playwright,
 )
 
-VERSION = "4.20"
+VERSION = "4.21"
 PROFILE_DIR = Path(__file__).parent / ".browser-profile"
 
 COMPANY_ALIASES = (
@@ -942,6 +942,7 @@ def assess_company_identity(
     website_domain: str = "",
     ambiguous_company: bool = False,
     trusted_google_panel: bool = False,
+    trusted_panel_website_association: bool = False,
     trusted_cui_panel_association: bool = False,
     corroborating_text: str = "",
 ) -> IdentityAssessment:
@@ -1007,6 +1008,14 @@ def assess_company_identity(
         # A logo-only site may omit its name from visible body text. Strongly
         # aligned domain and independent Google evidence can fill that one gap.
         name_score = 100 if trusted_cui_panel_association else 85
+    trusted_brand_association = (
+        trusted_panel_website_association
+        and name_score >= 35
+        and domain_score >= 70
+    )
+    effective_name_score = (
+        max(name_score, 85) if trusted_brand_association else name_score
+    )
     google_score = min(
         100,
         corroborating_company + round(corroborating_location * 0.25),
@@ -1018,7 +1027,7 @@ def assess_company_identity(
     # may be stale. Location therefore adds corroboration but never sits in the
     # weighted denominator where a mismatch could reduce identity confidence.
     weighted_components = [
-        (name_score, 0.45),
+        (effective_name_score, 0.45),
         (domain_score, 0.35),
     ]
     if normalize_text(corroborating_text):
@@ -1029,13 +1038,15 @@ def assess_company_identity(
     )
     location_bonus = round(address_score * 0.10 + locality_score * 0.05)
     score = min(100, identity_score + location_bonus)
-    if ambiguous_company:
+    if trusted_brand_association:
+        threshold = 70
+    elif ambiguous_company:
         threshold = 80
     else:
         threshold = 70
     accepted = (
         score >= threshold
-        and name_score >= 65
+        and (name_score >= 65 or trusted_brand_association)
         and (
             domain_score >= 70
             or google_score >= 70
@@ -1046,6 +1057,7 @@ def assess_company_identity(
         f"identity score {score}/{threshold} "
         f"(name={name_score}, domain={domain_score}, address={address_score}, "
         f"locality={locality_score}, Google={google_score}, "
+        f"panel-website={'yes' if trusted_brand_association else 'no'}, "
         f"CUI-panel={'yes' if trusted_cui_panel_association else 'no'})"
     )
     if accepted:
@@ -1972,7 +1984,9 @@ def email_score(email: str, source: str, website_domain: str) -> int:
     score = 0
     if domain == website_domain or domain.endswith("." + website_domain):
         score += 45
-    if local.startswith(GENERIC_EMAIL_PREFIXES):
+    if local.startswith(("office", "contact", "info")):
+        score += 45
+    elif local.startswith(GENERIC_EMAIL_PREFIXES):
         score += 35
     if local.startswith(LOW_PRIORITY_EMAIL_PREFIXES):
         score -= 40
@@ -2697,6 +2711,7 @@ def inspect_selected_website(
         website_domain=website_domain,
         ambiguous_company=ambiguous_company,
         trusted_google_panel=candidate.source == "knowledge_panel",
+        trusted_panel_website_association=is_decisive_panel_candidate(candidate),
         trusted_cui_panel_association=(
             candidate.source == "knowledge_panel"
             and contains_cui(expected_cui, candidate.query)

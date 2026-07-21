@@ -50,6 +50,7 @@ See README.md for fresh-run, resume, and retry commands.
 from __future__ import annotations
 
 import argparse
+import random
 import re
 import time
 import unicodedata
@@ -72,23 +73,44 @@ from playwright.sync_api import (
     sync_playwright,
 )
 
-VERSION = "4.17"
+VERSION = "4.18"
 PROFILE_DIR = Path(__file__).parent / ".browser-profile"
 
 COMPANY_ALIASES = (
     "denumire_companie",
     "denumire",
     "nume_firma",
+    "nume_companie",
     "firma",
     "company",
+    "company_name",
+    "companyname",
+    "nume",
+    "name",
 )
 CUI_ALIASES = (
     "cui_clean",
     "cui",
+    "cui_number",
+    "numar_cui",
     "cod_unic_inregistrare",
     "cod_fiscal",
+    "tax_id",
+    "vat_number",
+    "vat_id",
 )
 COUNTY_ALIASES = ("judet", "județ", "county")
+# A city/locality column is a different administrative level than județ
+# (county), but it still carries useful location evidence for matching, so
+# it is treated the same way as county when no județ column exists.
+CITY_ALIASES = (
+    "oras",
+    "oraș",
+    "localitate",
+    "localitatea",
+    "city",
+    "town",
+)
 ADDRESS_ALIASES = (
     "adresa_punctului_de_lucru",
     "adresa",
@@ -437,6 +459,19 @@ CUI_LABEL_RE = re.compile(
     r"cod(?:ul)?\s+(?:unic\s+de\s+[iî]nregistrare|fiscal))"
     r"\s*(?:nr\.?|numar(?:ul)?)?\s*[:#-]?\s*(?:ro\s*)?(\d{2,10})\b"
 )
+
+
+def jittered_sleep(base_seconds: float, spread: float = 0.6) -> None:
+    """Sleep a randomized duration around base_seconds.
+
+    A perfectly fixed delay between requests is itself a bot signal, so the
+    real sleep is drawn from base * (1 - spread) .. base * (1 + spread).
+    """
+    if base_seconds <= 0:
+        return
+    low = max(0.0, base_seconds * (1 - spread))
+    high = base_seconds * (1 + spread)
+    time.sleep(random.uniform(low, high))
 
 
 @dataclass
@@ -983,6 +1018,11 @@ def assess_company_identity(
     )
     if ambiguous_company:
         threshold = 80
+    elif trusted_google_panel and name_score >= 85 and domain_score >= 70:
+        # The panel's Website action is independent evidence tying the domain
+        # to this named company. Country sites often publish a headquarters or
+        # older address instead of the work-point address in the spreadsheet.
+        threshold = 60
     elif name_score >= 85 and domain_score >= 90:
         # An exact distinctive company/domain pair can represent the corporate
         # site even when Excel contains a branch address absent from the site.
@@ -1118,6 +1158,17 @@ def candidate_decision(
             address,
             combined,
         ):
+            accepted = True
+        elif (
+            not ambiguous
+            and company_score >= 85
+            and domain_score >= 22
+            and score >= min_website_score
+        ):
+            # Google's Website action explicitly associates this domain with
+            # the named entity. For a distinctive company, name and domain
+            # overlap are enough to inspect the site even when the panel omits
+            # the spreadsheet's CUI or branch address.
             accepted = True
         else:
             reason = "knowledge panel lacks matching CUI or full name/address"
@@ -1641,9 +1692,32 @@ def is_decisive_panel_candidate(candidate: GoogleCandidate) -> bool:
         candidate.accepted
         and candidate.source == "knowledge_panel"
         and candidate.score >= 95
-        and candidate.domain_score >= 32
+        and candidate.company_score >= 85
+        and candidate.domain_score >= 22
         and not candidate.duplicate_cuis
         and not is_verified_listing(candidate)
+    )
+
+
+def is_decisive_organic_candidate(
+    candidate: GoogleCandidate,
+    ambiguous_company: bool,
+) -> bool:
+    """A near-exact domain/company match is safe to stop searching on.
+
+    Unlike the panel check, this intentionally ignores rank: a company whose
+    full name literally forms the domain (domain_score near the max of 50)
+    is essentially unambiguous evidence on its own, so there's no benefit to
+    burning further Google queries confirming what we already know -- doing
+    so only adds request volume that risks a block for nothing.
+    """
+    return (
+        candidate.accepted
+        and candidate.source == "organic_result"
+        and candidate.company_score >= 65
+        and candidate.domain_score >= 45
+        and not candidate.duplicate_cuis
+        and not ambiguous_company
     )
 
 
@@ -1682,10 +1756,10 @@ def discover_website(
 
     for query_number, query in enumerate(queries, start=1):
         print(f"  Google query {query_number}: {query}")
-        search_url = (
-            "https://www.google.com/search?"
-            f"q={quote_plus(query)}&num={max_results}"
-        )
+        # No &num= override here: real users almost never set it, and Google's
+        # anti-abuse systems treat it as a signal. The top max_results organic
+        # links are still selected from whatever the default page returns.
+        search_url = f"https://www.google.com/search?q={quote_plus(query)}"
 
         try:
             page.goto(
@@ -1700,6 +1774,11 @@ def discover_website(
         if not wait_for_google_content(page, manual_captcha):
             if looks_like_google_block(page):
                 google_blocked = True
+                print(
+                    "    Google block detected; skipping remaining queries "
+                    "for this company to avoid making it worse."
+                )
+                break
             continue
 
         # IMPORTANT: inspect the right-side company panel before organic results.
@@ -1801,13 +1880,33 @@ def discover_website(
             if existing is None or candidate.score > existing.score:
                 inspection_candidates[candidate.domain] = candidate
 
+        decisive_organic = next(
+            (
+                candidate
+                for candidate in candidates
+                if is_decisive_organic_candidate(candidate, ambiguous)
+            ),
+            None,
+        )
+        if decisive_organic is not None:
+            print(
+                "    Decisive organic website match "
+                f"(domain={decisive_organic.domain}); stopping Google search."
+            )
+            return (
+                ordered_inspection_candidates(inspection_candidates),
+                best_review,
+                google_blocked,
+                best_panel_contact,
+            )
+
         if candidates:
             candidate = candidates[0]
             if best_review is None or candidate.score > best_review.score:
                 best_review = candidate
 
         if query_number < len(queries):
-            time.sleep(max(0.0, google_delay))
+            jittered_sleep(google_delay)
 
     return (
         ordered_inspection_candidates(inspection_candidates),
@@ -2057,6 +2156,25 @@ def footer_data(
         return [], [], []
 
 
+def sanitize_page_url(url: str) -> str:
+    """Strip a suspiciously corrupted query string before we store or open a link.
+
+    Some sites (commonly buggy calendar/event widgets) emit anchors whose
+    query string is really several chained parameter blocks concatenated
+    together, e.g. "?id_search=2%3Fevent_id%3D25%3Fmonth%3D4...". That's not
+    a real query string; treating it as one produces a link that's fragile to
+    open and useless as a record in the spreadsheet. A legitimate contact
+    page essentially never needs a query string this long or this shape, so
+    when we see the pattern we just drop the query entirely and keep the
+    clean path.
+    """
+    parsed = urlparse(url)
+    query = parsed.query
+    if query and (len(query) > 80 or "%3f" in query.casefold()):
+        return urlunparse(parsed._replace(query=""))
+    return url
+
+
 def contact_link_score(text: str, href: str) -> int:
     normalized_text = normalize_text(text)
     path = normalize_text(urlparse(href).path)
@@ -2105,6 +2223,7 @@ def discover_contact_url(
         href = normalize_url(urljoin(page.url, raw_href))
         if not href or canonical_domain(href) != website_domain:
             continue
+        href = sanitize_page_url(href)
 
         text = safe_inner_text(anchor, timeout=1_500)
         score = contact_link_score(text, href)
@@ -2535,6 +2654,7 @@ def inspect_selected_website(
         identity_text,
         website_domain=website_domain,
         ambiguous_company=ambiguous_company,
+        trusted_google_panel=candidate.source == "knowledge_panel",
         trusted_cui_panel_association=(
             candidate.source == "knowledge_panel"
             and contains_cui(expected_cui, candidate.query)
@@ -2597,7 +2717,16 @@ def inspect_selected_website(
     )
 
 
-def find_input_columns(ws, header_row: int) -> dict[str, int | None]:
+def find_input_columns(
+    ws,
+    header_row: int,
+    *,
+    company_column: str | None = None,
+    cui_column: str | None = None,
+    county_column: str | None = None,
+    address_column: str | None = None,
+) -> dict[str, int | None]:
+    raw_headers = [cell.value for cell in ws[header_row] if cell.value is not None]
     headers = {
         normalize_header(cell.value): cell.column
         for cell in ws[header_row]
@@ -2611,16 +2740,38 @@ def find_input_columns(ws, header_row: int) -> dict[str, int | None]:
                 return column
         return None
 
+    def resolve(explicit: str | None, aliases: tuple[str, ...]) -> int | None:
+        # An explicit --*-column override always wins and is matched with the
+        # same normalization used for aliases, so "Company Name", "company name"
+        # and "Company_Name" are all treated the same.
+        if explicit:
+            column = headers.get(normalize_header(explicit))
+            if column is not None:
+                return column
+            raise ValueError(
+                f"Column '{explicit}' not found in header row {header_row}. "
+                f"Available headers: {', '.join(str(h) for h in raw_headers)}"
+            )
+        return first_alias(aliases)
+
     columns = {
-        "company": first_alias(COMPANY_ALIASES),
-        "cui": first_alias(CUI_ALIASES),
-        "county": first_alias(COUNTY_ALIASES),
-        "address": first_alias(ADDRESS_ALIASES),
+        "company": resolve(company_column, COMPANY_ALIASES),
+        "cui": resolve(cui_column, CUI_ALIASES),
+        "county": resolve(county_column, COUNTY_ALIASES) or first_alias(CITY_ALIASES),
+        "address": resolve(address_column, ADDRESS_ALIASES),
     }
     if columns["company"] is None:
-        raise ValueError("Company-name column not found")
+        raise ValueError(
+            "Company-name column not found. Available headers: "
+            f"{', '.join(str(h) for h in raw_headers)}. "
+            "Use --company-column \"Exact Header\" to point at it directly."
+        )
     if columns["cui"] is None:
-        raise ValueError("CUI column not found")
+        raise ValueError(
+            "CUI column not found. Available headers: "
+            f"{', '.join(str(h) for h in raw_headers)}. "
+            "Use --cui-column \"Exact Header\" to point at it directly."
+        )
     return columns
 
 
@@ -2776,8 +2927,46 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--only-cui")
     parser.add_argument("--max-results", type=int, default=10)
     parser.add_argument("--min-website-score", type=int, default=55)
-    parser.add_argument("--google-delay", type=float, default=4.0)
-    parser.add_argument("--company-delay", type=float, default=7.0)
+    parser.add_argument(
+        "--company-column",
+        help="Exact header text for the company-name column, if auto-detection fails",
+    )
+    parser.add_argument(
+        "--cui-column",
+        help="Exact header text for the CUI/tax-id column, if auto-detection fails",
+    )
+    parser.add_argument(
+        "--county-column",
+        help="Exact header text for the county/city column, if auto-detection fails",
+    )
+    parser.add_argument(
+        "--address-column",
+        help="Exact header text for the address column, if auto-detection fails",
+    )
+    parser.add_argument(
+        "--google-delay",
+        type=float,
+        default=4.0,
+        help="Base seconds between Google queries; actual delay is randomized around this",
+    )
+    parser.add_argument(
+        "--company-delay",
+        type=float,
+        default=7.0,
+        help="Base seconds between companies; actual delay is randomized around this",
+    )
+    parser.add_argument(
+        "--break-every",
+        type=int,
+        default=25,
+        help="Take a longer cooldown break after this many companies (0 disables)",
+    )
+    parser.add_argument(
+        "--break-seconds",
+        type=float,
+        default=90.0,
+        help="Length of the periodic cooldown break, in seconds",
+    )
     parser.add_argument("--manual-captcha", action="store_true", default=True)
     parser.add_argument(
         "--no-manual-captcha",
@@ -2828,7 +3017,14 @@ def main() -> int:
         ws = workbook.worksheets[0]
 
     try:
-        input_columns = find_input_columns(ws, args.header_row)
+        input_columns = find_input_columns(
+            ws,
+            args.header_row,
+            company_column=args.company_column,
+            cui_column=args.cui_column,
+            county_column=args.county_column,
+            address_column=args.address_column,
+        )
     except ValueError as exc:
         print(f"ERROR: {exc}")
         return 2
@@ -2859,6 +3055,7 @@ def main() -> int:
 
     processed = 0
     status_counts: dict[str, int] = {}
+    consecutive_blocks = 0
 
     with sync_playwright() as playwright:
         context: BrowserContext = playwright.chromium.launch_persistent_context(
@@ -2879,6 +3076,9 @@ def main() -> int:
                 address = cell_text(ws, row, input_columns["address"])
 
                 if not company or not cui:
+                    print(
+                        f"  Row {row}: skipping (missing company name or CUI)"
+                    )
                     continue
                 if args.only_cui and cui != normalize_cui(args.only_cui):
                     continue
@@ -3003,6 +3203,11 @@ def main() -> int:
                 processed += 1
                 status_counts[result.status] = status_counts.get(result.status, 0) + 1
 
+                if result.status == "GOOGLE_BLOCKED":
+                    consecutive_blocks += 1
+                else:
+                    consecutive_blocks = 0
+
                 if (
                     result.website
                     and not is_excluded_domain(canonical_domain(result.website))
@@ -3027,7 +3232,26 @@ def main() -> int:
 
                 if args.only_cui:
                     break
-                time.sleep(max(0.0, args.company_delay))
+
+                if consecutive_blocks > 0:
+                    # Back off harder the more blocks we hit in a row, instead
+                    # of continuing to poke Google at the normal pace.
+                    cooldown = min(600.0, 45.0 * (2 ** (consecutive_blocks - 1)))
+                    print(
+                        f"  Google blocked {consecutive_blocks}x in a row; "
+                        f"cooling down for ~{cooldown:.0f}s. If this keeps "
+                        "happening, stop the run, solve a CAPTCHA manually "
+                        "in the visible browser, and resume with --resume."
+                    )
+                    jittered_sleep(cooldown, spread=0.2)
+                elif args.break_every > 0 and processed % args.break_every == 0:
+                    print(
+                        f"  Taking a longer break after {processed} companies "
+                        f"(~{args.break_seconds:.0f}s) to look less like a script."
+                    )
+                    jittered_sleep(args.break_seconds, spread=0.2)
+                else:
+                    jittered_sleep(args.company_delay)
 
         except KeyboardInterrupt:
             print()
